@@ -222,6 +222,15 @@ void runtime_motion_live(int on);   /* a controller with motion attached (1) / d
 void runtime_motion_phone(int on);  /* the iPhone's own sensor feeds the six-axis device (1) / stops (0) */
 void runtime_motion_mouse(int on);  /* mouse mode (key 7) takes the sensor over (1) / gives it back to the controller (0) */
 void runtime_motion_feed_mouse(const double acc_g[3], const double gyro_rad_s[3], uint64_t now_ns);   /* already in the reference frame */
+/* Gyro calibration (settings panel; runtime/motion_fusion.c): a countdown, then the mean of the resting rate is the bias taken off every sample. */
+enum { GYRO_CAL_IDLE, GYRO_CAL_COUNTDOWN, GYRO_CAL_SAMPLING, GYRO_CAL_DONE, GYRO_CAL_MOVED, GYRO_CAL_NO_DATA };
+void runtime_gyro_cal_start(void);
+void runtime_gyro_cal_cancel(void);
+int runtime_gyro_cal_state(double *seconds_left);   /* a GYRO_CAL_ phase; the time left of the countdown or sampling */
+void runtime_gyro_bias_get(double bias_rad_s[3]);
+void runtime_gyro_bias_set(const double bias_rad_s[3]);
+void runtime_gyro_bias_clear(void);   /* no bias (saved as such) */
+void runtime_gyro_bias_hook(void (*save)(const double bias_rad_s[3]));   /* called when a calibration or a clear changed the bias */
 void runtime_feedback_quiet(void);   /* focus lost: stop rumbling */
 #ifdef __OBJC__
 @class GCController;

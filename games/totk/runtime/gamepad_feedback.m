@@ -922,6 +922,27 @@ static BOOL hid_imu_start(GCController *c) {   /* the raw HID fallback is macOS 
 }
 #endif
 
+/* ---- gyro bias (settings panel "Gyro calibration"; the math is in motion_fusion.c) ----
+   gyro-bias.txt next to controls.txt: the bias in degrees a second on the controller's raw axes, "x,y,z"; none means 0. */
+static void gyro_bias_save(const double b[3]) {   /* any queue: a calibration finished or the bias was cleared */
+    if (!b[0] && !b[1] && !b[2]) { runtime_setting_remove("gyro-bias.txt"); return; }
+    char word[96]; snprintf(word, sizeof word, "%.6f,%.6f,%.6f", b[0] * 180 / M_PI, b[1] * 180 / M_PI, b[2] * 180 / M_PI);
+    runtime_setting_save("gyro-bias.txt", word, "gyro calibration");
+}
+static void gyro_bias_load(void) {   /* main queue, once */
+    runtime_gyro_bias_hook(gyro_bias_save);
+    char word[96];
+    if (!runtime_setting_word("gyro-bias.txt", word, sizeof word)) return;
+    double d[3]; int used = 0;
+    if (sscanf(word, " %lf , %lf , %lf %n", &d[0], &d[1], &d[2], &used) != 3 || used <= 0 || !isfinite(d[0] + d[1] + d[2]) ||
+        fabs(d[0]) > 60 || fabs(d[1]) > 60 || fabs(d[2]) > 60) {
+        fprintf(stderr, "[gyro] gyro-bias.txt is not three numbers of degrees a second within 60: ignored\n"); return;
+    }
+    const double b[3] = {d[0] * M_PI / 180, d[1] * M_PI / 180, d[2] * M_PI / 180};
+    runtime_gyro_bias_set(b);
+    fprintf(stderr, "[gyro] saved calibration: bias (%+.4f %+.4f %+.4f) deg/s\n", d[0], d[1], d[2]);
+}
+
 /* ---- controllers ---- */
 void runtime_feedback_attach(GCController *c) {   /* main queue */
     const char *name = (c.vendorName ?: @"controller").UTF8String;
@@ -952,6 +973,7 @@ void runtime_feedback_attach(GCController *c) {   /* main queue */
     if (runtime_gyro_enabled()) {
         static dispatch_once_t once;
         dispatch_once(&once, ^{
+            gyro_bias_load();
             const char *axes = getenv("TOTK_GYRO_AXES"); int r = runtime_motion_axes(axes);
             if (r < 0) runtime_fail("TOTK_GYRO_AXES must name x, y and z once each, e.g. \"-x,y,-z\"");
             if (r > 0) fprintf(stderr, "[gyro] axes remapped by TOTK_GYRO_AXES=%s\n", axes);
