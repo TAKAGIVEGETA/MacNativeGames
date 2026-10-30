@@ -641,7 +641,7 @@ void mtl_init(void) {
     g_ct = [g_dev newArgumentTableWithDescriptor:atd error:&ate]; if (!g_ct) MDIE("建立 compute argument table 失败：%s", ate.localizedDescription.UTF8String);
     g_up_ct = [g_dev newArgumentTableWithDescriptor:atd error:&ate]; if (!g_up_ct) MDIE("建立上传 compute argument table 失败：%s", ate.localizedDescription.UTF8String);
     MTL4ArgumentTableDescriptor *pad = [MTL4ArgumentTableDescriptor new];
-    pad.maxTextureBindCount = 1; pad.maxSamplerStateBindCount = 1; pad.maxBufferBindCount = 1;
+    pad.maxTextureBindCount = 2; pad.maxSamplerStateBindCount = 1; pad.maxBufferBindCount = 1;
     g_bloomq_args = [g_dev newArgumentTableWithDescriptor:pad error:&ate];
     if (!g_bloomq_args) MDIE("建立泛光 1/4 argument table 失败：%s", ate.localizedDescription.UTF8String);
     for (int i = 0; i < 3; i++) {
@@ -13860,10 +13860,40 @@ void mtl_exec(const uint8_t *p) {
 
 // ---------- 出图：交换链贴图画到 CAMetalLayer；可选截图 ----------
 // ---------- Present: draw the swapchain texture to the CAMetalLayer; optional screenshot ----------
-static id<MTLRenderPipelineState> g_blit_pso; static id<MTLRenderPipelineState> g_reshade_pso; static MTLPixelFormat g_blit_fmt;
-static _Atomic int g_reshade_enabled = 0;
-int reshade_enabled(void) { return atomic_load(&g_reshade_enabled); }
-void reshade_set(int on) { atomic_store(&g_reshade_enabled, on ? 1 : 0); }
+#include "totk_remastered_lut.h"
+static id<MTLRenderPipelineState> g_blit_pso; static id<MTLRenderPipelineState> g_reshade_pso; static id<MTLRenderPipelineState> g_remastered_pso; static MTLPixelFormat g_blit_fmt;
+static id<MTLTexture> g_remastered_lut_tex;
+static _Atomic int g_reshade_mode = 0;
+int reshade_mode(void) { return atomic_load(&g_reshade_mode); }
+void reshade_mode_set(int mode) { atomic_store(&g_reshade_mode, (mode >= 0 && mode <= 2) ? mode : 0); }
+int reshade_enabled(void) { return reshade_mode() != 0; }
+void reshade_set(int on) { reshade_mode_set(on ? 1 : 0); }
+
+static inline id<MTLRenderPipelineState> present_select_pso(void) {
+    int m = atomic_load(&g_reshade_mode);
+    if (m == 1 && g_reshade_pso) return g_reshade_pso;
+    if (m == 2 && g_remastered_pso) return g_remastered_pso;
+    return g_blit_pso;
+}
+
+static void ensure_remastered_lut_tex(void) {
+    if (g_remastered_lut_tex) return;
+    MTLTextureDescriptor *d = [MTLTextureDescriptor new];
+    d.textureType = MTLTextureType3D;
+    d.pixelFormat = MTLPixelFormatRGBA8Unorm;
+    d.width = 32; d.height = 32; d.depth = 32;
+    d.usage = MTLTextureUsageShaderRead;
+    d.storageMode = MTLStorageModeShared;
+    g_remastered_lut_tex = [g_dev newTextureWithDescriptor:d];
+    if (!g_remastered_lut_tex) MDIE("建立 Remastered 3D LUT 贴图失败");
+    [g_remastered_lut_tex replaceRegion:MTLRegionMake3D(0, 0, 0, 32, 32, 32)
+                            mipmapLevel:0
+                                  slice:0
+                              withBytes:g_remastered_lut_data
+                            bytesPerRow:32 * 4
+                          bytesPerImage:32 * 32 * 4];
+    res_add(g_remastered_lut_tex);
+}
 static id<MTLSamplerState> g_blit_samp;
 static uint64_t g_present_n;
 uint64_t mtl_present_count(void) { return g_present_n; }   // 实际出图次数（发热归因 DM_HEAT 算出图帧率） | Actual present count (heat attribution DM_HEAT computes the present frame rate)
@@ -14328,7 +14358,8 @@ static _Atomic uint64_t g_present_stall_ns;   // 单测用：出图线程每次�
 static CAMetalLayer *g_present_layer_resident;
 void mtl_present_test_stall(uint64_t ns) { g_present_stall_ns = ns; }
 static void present_pipeline(MTLPixelFormat format) {
-    if (!g_blit_pso || !g_reshade_pso || g_blit_fmt != format) {
+    if (!g_blit_pso || !g_reshade_pso || !g_remastered_pso || g_blit_fmt != format) {
+        ensure_remastered_lut_tex();
         static const char *src_msl =
             "#include <metal_stdlib>\nusing namespace metal;\n"
             "struct V { float4 p [[position]]; float2 uv; };\n"
@@ -14368,6 +14399,18 @@ static void present_pipeline(MTLPixelFormat format) {
             "    float sharp_luma = clamp(dot(float4(sharp, 1.0), float4(sharp_luma_vec, 0.5)), 0.0, 1.0);\n"
             "    sharp_luma = 0.05 * sharp_luma - 0.025;\n"
             "    return float4(clamp(ori + float3(sharp_luma), 0.0, 1.0), 1.0);\n"
+            "}\n"
+            "fragment float4 fs_remastered(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]], texture3d<float> lut [[texture(1)]]) {\n"
+            "    float2 uv = clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw);\n"
+            "    float3 raw_c = t.sample(s, uv).rgb;\n"
+            "    float3 col = clamp(raw_c, 0.0, 1.0);\n"
+            "    float3 lut_coord = col * (31.0 / 32.0) + (0.5 / 32.0);\n"
+            "    float3 lut_col = lut.sample(s, lut_coord).rgb;\n"
+            "    float luma_orig = length(col);\n"
+            "    float luma_lut = length(lut_col);\n"
+            "    if (luma_orig < 1e-5) return float4(0.0, 0.0, 0.0, 1.0);\n"
+            "    float3 out_col = normalize(lut_col + 1e-6) * (luma_orig * 0.1 + luma_lut * 0.9);\n"
+            "    return float4(clamp(out_col, 0.0, 1.0), 1.0);\n"
             "}\n";
         NSError *e = nil;
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(src_msl) options:nil error:&e];
@@ -14382,8 +14425,15 @@ static void present_pipeline(MTLPixelFormat format) {
         rpd.colorAttachments[0].pixelFormat = format;
         g_reshade_pso = [g_dev newRenderPipelineStateWithDescriptor:rpd error:&e];
         if (!g_reshade_pso) MDIE("ReShade管线失败 %s", e.localizedDescription.UTF8String);
+        MTLRenderPipelineDescriptor *lut_pd = [MTLRenderPipelineDescriptor new];
+        lut_pd.vertexFunction = [lib newFunctionWithName:@"vs"]; lut_pd.fragmentFunction = [lib newFunctionWithName:@"fs_remastered"];
+        lut_pd.colorAttachments[0].pixelFormat = format;
+        g_remastered_pso = [g_dev newRenderPipelineStateWithDescriptor:lut_pd error:&e];
+        if (!g_remastered_pso) MDIE("Remastered管线失败 %s", e.localizedDescription.UTF8String);
         g_blit_fmt = format;
-        MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear; sd.supportArgumentBuffers = YES;
+        MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
+        sd.rAddressMode = sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+        sd.supportArgumentBuffers = YES;
         g_blit_samp = [g_dev newSamplerStateWithDescriptor:sd];
     }
 }
@@ -14609,8 +14659,10 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp]; es_reset();
     [en setViewport:vp];
-    id<MTLRenderPipelineState> pso = (atomic_load(&g_reshade_enabled) && g_reshade_pso) ? g_reshade_pso : g_blit_pso;
-    [en setRenderPipelineState:pso]; [en setFragmentTexture:src atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
+    id<MTLRenderPipelineState> pso = present_select_pso();
+    [en setRenderPipelineState:pso]; [en setFragmentTexture:src atIndex:0];
+    if (g_remastered_lut_tex) [en setFragmentTexture:g_remastered_lut_tex atIndex:1];
+    [en setFragmentSamplerState:g_blit_samp atIndex:0];
     float uv[8] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
                    (cx + 0.5f) / src.width, (cy + 0.5f) / src.height, (cx + cw - 0.5f) / src.width, (cy + ch - 0.5f) / src.height};
     [en setFragmentBytes:uv length:sizeof uv atIndex:0];
@@ -14658,13 +14710,14 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
     id<MTL4ArgumentTable> args = g_present_args[uv_i];
     [args setTexture:pic.gpuResourceID atIndex:0];
+    if (g_remastered_lut_tex) [args setTexture:g_remastered_lut_tex.gpuResourceID atIndex:1];
     [args setSamplerState:g_blit_samp.gpuResourceID atIndex:0];
     float *uv = g_present_uv[uv_i].contents;
     uv[0] = (float)cx / pic.width; uv[1] = (float)cy / pic.height; uv[2] = (float)cw / pic.width; uv[3] = (float)ch / pic.height;
     uv[4] = (cx + 0.5f) / pic.width; uv[5] = (cy + 0.5f) / pic.height; uv[6] = (cx + cw - 0.5f) / pic.width; uv[7] = (cy + ch - 0.5f) / pic.height;
     [args setAddress:g_present_uv[uv_i].gpuAddress atIndex:0];
     [en setArgumentTable:args atStages:MTLRenderStageFragment];
-    id<MTLRenderPipelineState> pso = (atomic_load(&g_reshade_enabled) && g_reshade_pso) ? g_reshade_pso : g_blit_pso;
+    id<MTLRenderPipelineState> pso = present_select_pso();
     [en setViewport:vp]; [en setRenderPipelineState:pso];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     MTLViewport ovp; float fuv[8];

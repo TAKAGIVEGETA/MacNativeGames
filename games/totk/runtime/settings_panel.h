@@ -113,8 +113,11 @@ static void settings_restore_begin(void) {
  }
  if(!getenv("TOTK_TAA")&&settings_read_int("graphics-taa.txt",&v)&&(v==0||v==1))taa_set(v);
  const char *reshade_env = getenv("TOTK_RESHADE");
- if(reshade_env) reshade_set(atoi(reshade_env) ? 1 : 0);
- else if(settings_read_int("graphics-reshade.txt",&v)&&(v==0||v==1)) reshade_set(v);
+ if(reshade_env) {
+  if(!strcasecmp(reshade_env, "remastered") || !strcmp(reshade_env, "2")) reshade_mode_set(2);
+  else if(!strcasecmp(reshade_env, "all_time") || !strcmp(reshade_env, "1")) reshade_mode_set(1);
+  else reshade_mode_set(atoi(reshade_env));
+ } else if(settings_read_int("graphics-reshade.txt",&v)&&(v>=0&&v<=2)) reshade_mode_set(v);
  const char *output=getenv("TOTK_OUTPUT_RES");
  if((!output||!*output||!strcmp(output,"auto"))&&!getenv("TOTK_MFX_OUTPUT")&&!getenv("TOTK_MFX_UPSCALE")&&
     settings_read_int("graphics-output.txt",&v)&&v<=OUTPUT_MODE_720P)settingsPendingOutput=v;
@@ -310,9 +313,16 @@ static NSArray<TOTKSettingRow *> *settings_rows(void) {
    ^(int v){float r=ratios[(NSUInteger)v].floatValue;settingsPendingAspect=0;if(runtime_aspect_set_ratio(r)){runtime_front_resize_aspect(r);char word[32];snprintf(word,sizeof word,"%.8g",r);runtime_setting_save("graphics-aspect.txt",word,"aspect ratio");}})];}
  [rows addObject:settings_row(settings_text("边缘平滑（MetalFX 时间性）","Edge smoothing (MetalFX Temporal)"),nil,nil,
   ^int{return taa_enabled();},^(int v){taa_set(v);settings_save_int("graphics-taa.txt",v,"edge smoothing");})];
- if(getenv("TOTK_RESHADE"))[rows addObject:settings_fixed(settings_text("画质滤镜（ReShade）","Shader preset (ReShade)"),settings_text("由 TOTK_RESHADE 设置","Set by TOTK_RESHADE"))];
- else [rows addObject:settings_row(settings_text("画质滤镜（ReShade）","Shader preset (ReShade)"),nil,nil,
-  ^int{return reshade_enabled();},^(int v){reshade_set(v);settings_save_int("graphics-reshade.txt",v,"reshade filter");})];
+ NSArray<NSString *> *reshade_choices = @[settings_text("关闭","Off"), @"Reshade Of All Time", @"ToTK Remastered"];
+ NSArray<NSNumber *> *reshade_values = @[@0, @1, @2];
+ if(getenv("TOTK_RESHADE")) {
+  int cur = reshade_mode();
+  NSString *cur_name = cur == 1 ? @"Reshade Of All Time" : (cur == 2 ? @"ToTK Remastered" : settings_text("关闭","Off"));
+  [rows addObject:settings_fixed(settings_text("画质滤镜（ReShade）","Color Filter (ReShade)"), [NSString stringWithFormat:@"%@ (%@)", cur_name, settings_text("由 TOTK_RESHADE 设置","Set by TOTK_RESHADE")])];
+ } else {
+  [rows addObject:settings_row(settings_text("画质滤镜（ReShade）","Color Filter (ReShade)"), reshade_choices, reshade_values,
+   ^int{return reshade_mode();}, ^(int v){reshade_mode_set(v); settings_save_int("graphics-reshade.txt", v, "color filter preset");})];
+ }
  NSUInteger display=rows.count;
  /* Input */
  TOTKSettingRow *pad=settings_row(settings_text("手柄类型","Controller type"),@[settings_pad_auto_text(),@"Xbox",@"PlayStation",@"Switch"],

@@ -34,6 +34,8 @@ static int textEntryOpen;
 static void front_mouse_update(void);
 int taa_enabled(void);   /* third_party/d2r_gfx/gfx/nvn/totk_taa.m: edge smoothing in the settings panel */
 void taa_set(int on);
+int reshade_mode(void);
+void reshade_mode_set(int mode);
 int reshade_enabled(void);
 void reshade_set(int on);
 static uint64_t bootStartNS;
