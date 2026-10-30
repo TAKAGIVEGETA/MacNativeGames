@@ -13860,7 +13860,10 @@ void mtl_exec(const uint8_t *p) {
 
 // ---------- 出图：交换链贴图画到 CAMetalLayer；可选截图 ----------
 // ---------- Present: draw the swapchain texture to the CAMetalLayer; optional screenshot ----------
-static id<MTLRenderPipelineState> g_blit_pso; static MTLPixelFormat g_blit_fmt;
+static id<MTLRenderPipelineState> g_blit_pso; static id<MTLRenderPipelineState> g_reshade_pso; static MTLPixelFormat g_blit_fmt;
+static _Atomic int g_reshade_enabled = 0;
+int reshade_enabled(void) { return atomic_load(&g_reshade_enabled); }
+void reshade_set(int on) { atomic_store(&g_reshade_enabled, on ? 1 : 0); }
 static id<MTLSamplerState> g_blit_samp;
 static uint64_t g_present_n;
 uint64_t mtl_present_count(void) { return g_present_n; }   // 实际出图次数（发热归因 DM_HEAT 算出图帧率） | Actual present count (heat attribution DM_HEAT computes the present frame rate)
@@ -14325,13 +14328,47 @@ static _Atomic uint64_t g_present_stall_ns;   // 单测用：出图线程每次�
 static CAMetalLayer *g_present_layer_resident;
 void mtl_present_test_stall(uint64_t ns) { g_present_stall_ns = ns; }
 static void present_pipeline(MTLPixelFormat format) {
-    if (!g_blit_pso || g_blit_fmt != format) {
+    if (!g_blit_pso || !g_reshade_pso || g_blit_fmt != format) {
         static const char *src_msl =
             "#include <metal_stdlib>\nusing namespace metal;\n"
             "struct V { float4 p [[position]]; float2 uv; };\n"
             "vertex V vs(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); V o; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = uv; return o; }\n"
             "struct Crop { float4 rect; float4 edge; };\n"
-            "fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) { return t.sample(s, clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw)); }\n";
+            "fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) { return t.sample(s, clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw)); }\n"
+            "inline float3 apply_colormatrix(float3 c) {\n"
+            "    float3 m = float3(dot(float3(0.587, 0.206, 0.138), c), dot(float3(0.274, 0.491, 0.300), c), dot(float3(0.311, 0.255, 0.533), c));\n"
+            "    return clamp(mix(c, m, 0.555), 0.0, 1.0);\n"
+            "}\n"
+            "inline float3 apply_fakehdr(float3 c, float3 diff) {\n"
+            "    float3 hdr = (c + diff) * 0.010;\n"
+            "    float3 blend = hdr + c;\n"
+            "    return clamp(pow(abs(blend), float3(1.532)) + hdr, 0.0, 1.0);\n"
+            "}\n"
+            "fragment float4 fs_reshade(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) {\n"
+            "    float2 ps = float2(1.0 / float(t.get_width()), 1.0 / float(t.get_height()));\n"
+            "    float2 uv = clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw);\n"
+            "    float3 raw_c = t.sample(s, uv).rgb;\n"
+            "    float3 col_c = apply_colormatrix(raw_c);\n"
+            "    const float2 o[8] = { float2(1.5, -1.5), float2(-1.5, -1.5), float2(1.5, 1.5), float2(-1.5, 1.5), float2(0.0, -2.5), float2(0.0, 2.5), float2(-2.5, 0.0), float2(2.5, 0.0) };\n"
+            "    float3 s1 = float3(0.0);\n"
+            "    for (int i = 0; i < 8; i++) s1 += t.sample(s, clamp(uv + o[i] * (0.650 * ps), c.edge.xy, c.edge.zw)).rgb;\n"
+            "    float3 b1 = apply_colormatrix(s1 * 0.005);\n"
+            "    float3 s2 = float3(0.0);\n"
+            "    for (int i = 0; i < 8; i++) s2 += t.sample(s, clamp(uv + o[i] * (0.660 * ps), c.edge.xy, c.edge.zw)).rgb;\n"
+            "    float3 b2 = apply_colormatrix(s2 * 0.010);\n"
+            "    float3 diff = b2 - b1;\n"
+            "    float3 ori = apply_fakehdr(col_c, diff);\n"
+            "    const float2 bo[4] = { float2(0.4, -1.2) * 0.659, float2(-1.2, -0.4) * 0.659, float2(1.2, 0.4) * 0.659, float2(-0.4, 1.2) * 0.659 };\n"
+            "    float3 bs = float3(0.0);\n"
+            "    for (int i = 0; i < 4; i++) bs += t.sample(s, clamp(uv + bo[i] * ps, c.edge.xy, c.edge.zw)).rgb;\n"
+            "    float3 blur_col = apply_colormatrix(bs * 0.25);\n"
+            "    float3 blur_ori = apply_fakehdr(blur_col, diff);\n"
+            "    float3 sharp = ori - blur_ori;\n"
+            "    float3 sharp_luma_vec = float3(0.2126, 0.7152, 0.0722) * (1.301 * 0.51 * 20.0);\n"
+            "    float sharp_luma = clamp(dot(float4(sharp, 1.0), float4(sharp_luma_vec, 0.5)), 0.0, 1.0);\n"
+            "    sharp_luma = 0.05 * sharp_luma - 0.025;\n"
+            "    return float4(clamp(ori + float3(sharp_luma), 0.0, 1.0), 1.0);\n"
+            "}\n";
         NSError *e = nil;
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:@(src_msl) options:nil error:&e];
         if (!lib) MDIE("出图着色器编译失败 %s", e.localizedDescription.UTF8String);
@@ -14340,6 +14377,11 @@ static void present_pipeline(MTLPixelFormat format) {
         pd.colorAttachments[0].pixelFormat = format;
         g_blit_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
         if (!g_blit_pso) MDIE("出图管线失败 %s", e.localizedDescription.UTF8String);
+        MTLRenderPipelineDescriptor *rpd = [MTLRenderPipelineDescriptor new];
+        rpd.vertexFunction = [lib newFunctionWithName:@"vs"]; rpd.fragmentFunction = [lib newFunctionWithName:@"fs_reshade"];
+        rpd.colorAttachments[0].pixelFormat = format;
+        g_reshade_pso = [g_dev newRenderPipelineStateWithDescriptor:rpd error:&e];
+        if (!g_reshade_pso) MDIE("ReShade管线失败 %s", e.localizedDescription.UTF8String);
         g_blit_fmt = format;
         MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear; sd.supportArgumentBuffers = YES;
         g_blit_samp = [g_dev newSamplerStateWithDescriptor:sd];
@@ -14567,7 +14609,8 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp]; es_reset();
     [en setViewport:vp];
-    [en setRenderPipelineState:g_blit_pso]; [en setFragmentTexture:src atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
+    id<MTLRenderPipelineState> pso = (atomic_load(&g_reshade_enabled) && g_reshade_pso) ? g_reshade_pso : g_blit_pso;
+    [en setRenderPipelineState:pso]; [en setFragmentTexture:src atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
     float uv[8] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
                    (cx + 0.5f) / src.width, (cy + 0.5f) / src.height, (cx + cw - 0.5f) / src.width, (cy + ch - 0.5f) / src.height};
     [en setFragmentBytes:uv length:sizeof uv atIndex:0];
@@ -14621,7 +14664,8 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     uv[4] = (cx + 0.5f) / pic.width; uv[5] = (cy + 0.5f) / pic.height; uv[6] = (cx + cw - 0.5f) / pic.width; uv[7] = (cy + ch - 0.5f) / pic.height;
     [args setAddress:g_present_uv[uv_i].gpuAddress atIndex:0];
     [en setArgumentTable:args atStages:MTLRenderStageFragment];
-    [en setViewport:vp]; [en setRenderPipelineState:g_blit_pso];
+    id<MTLRenderPipelineState> pso = (atomic_load(&g_reshade_enabled) && g_reshade_pso) ? g_reshade_pso : g_blit_pso;
+    [en setViewport:vp]; [en setRenderPipelineState:pso];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     MTLViewport ovp; float fuv[8];
     if (fps_overlay_prepare(uv_i, vp, &ovp, fuv)) {   // argument-table bindings are captured per draw, so rebinding here leaves the game picture's draw intact

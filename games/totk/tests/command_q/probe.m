@@ -90,6 +90,8 @@ void runtime_aspect_view(double w,double h){(void)w;(void)h;}
 int taa_enabled(void){return 0;}
 /* The settings panel (runtime/settings_panel.h) is not opened here. */
 void taa_set(int on){(void)on;}
+int reshade_enabled(void){return 0;}
+void reshade_set(int on){(void)on;}
 int mfx_requested(void){return 0;}
 int fps_overlay_hud_mode(void){return 1;}
 void dm_gfx_set_flag(const char *name,int value){(void)name;(void)value;}

@@ -112,6 +112,9 @@ static void settings_restore_begin(void) {
   else if(!strcmp(word,"off")||!strcmp(word,"off\n")){nvn_fps_lock_set(0);dm_gfx_set_flag("mfx_interp",MFX_OFF);}
  }
  if(!getenv("TOTK_TAA")&&settings_read_int("graphics-taa.txt",&v)&&(v==0||v==1))taa_set(v);
+ const char *reshade_env = getenv("TOTK_RESHADE");
+ if(reshade_env) reshade_set(atoi(reshade_env) ? 1 : 0);
+ else if(settings_read_int("graphics-reshade.txt",&v)&&(v==0||v==1)) reshade_set(v);
  const char *output=getenv("TOTK_OUTPUT_RES");
  if((!output||!*output||!strcmp(output,"auto"))&&!getenv("TOTK_MFX_OUTPUT")&&!getenv("TOTK_MFX_UPSCALE")&&
     settings_read_int("graphics-output.txt",&v)&&v<=OUTPUT_MODE_720P)settingsPendingOutput=v;
@@ -307,6 +310,9 @@ static NSArray<TOTKSettingRow *> *settings_rows(void) {
    ^(int v){float r=ratios[(NSUInteger)v].floatValue;settingsPendingAspect=0;if(runtime_aspect_set_ratio(r)){runtime_front_resize_aspect(r);char word[32];snprintf(word,sizeof word,"%.8g",r);runtime_setting_save("graphics-aspect.txt",word,"aspect ratio");}})];}
  [rows addObject:settings_row(settings_text("边缘平滑（MetalFX 时间性）","Edge smoothing (MetalFX Temporal)"),nil,nil,
   ^int{return taa_enabled();},^(int v){taa_set(v);settings_save_int("graphics-taa.txt",v,"edge smoothing");})];
+ if(getenv("TOTK_RESHADE"))[rows addObject:settings_fixed(settings_text("画质滤镜（ReShade）","Shader preset (ReShade)"),settings_text("由 TOTK_RESHADE 设置","Set by TOTK_RESHADE"))];
+ else [rows addObject:settings_row(settings_text("画质滤镜（ReShade）","Shader preset (ReShade)"),nil,nil,
+  ^int{return reshade_enabled();},^(int v){reshade_set(v);settings_save_int("graphics-reshade.txt",v,"reshade filter");})];
  NSUInteger display=rows.count;
  /* Input */
  TOTKSettingRow *pad=settings_row(settings_text("手柄类型","Controller type"),@[settings_pad_auto_text(),@"Xbox",@"PlayStation",@"Switch"],
