@@ -1,12 +1,4 @@
-/* Gyro calibration (2026-10-29, settings panel "Gyro calibration"): a controller's gyro can rest off zero (a Beitong
-   TVBNS pad in Switch mode drifted the aim with the factory calibration), so the panel counts down 5 s (lay the controller
-   still), then takes 3 s of raw rotation rate, centres it on its median and keeps the mean of the samples within 0.1 rad/s
-   of that (a resting gyro may sit far from zero, so the rate itself says nothing about moving). The bias
-   is taken off every sample in the controller's raw frame, before the TOTK_GYRO_AXES remap and the dead zone, whichever
-   source feeds it. It is accepted with at least 30 samples and no more than a tenth of them scattering; else the
-   old bias stays. Saving it is the caller's (runtime_gyro_bias_hook; gamepad_feedback.m writes gyro-bias.txt): this file
-   is also linked into probes that have no settings files.
-   Six-axis states from the Mac controller's motion samples (2026-10-17; fed by runtime/gamepad_feedback.m, read by the
+/* Six-axis states from the Mac controller's motion samples (2026-10-17; fed by runtime/gamepad_feedback.m, read by the
    game through runtime/hid_feedback.c, only with TOTK_GYRO=1).
    Input per sample: acceleration in G including gravity and rotation rate in rad/s, in the controller's frame (GCMotion:
    x to the right, y toward the top edge, z out of the face; lying face up it reads z = -1 G). That is the Switch's
@@ -68,86 +60,6 @@ static uint64_t win_start, win_last;
 static int win_n;
 static double win_g[3], win_a[3], win_gmin[3], win_gmax[3], win_amin[3], win_amax[3];
 static int mouse_owns, controller_live, phone_live;
-
-enum { GYRO_CAL_COUNTDOWN_S = 5, GYRO_CAL_SAMPLE_S = 3, GYRO_CAL_RESULT_S = 8, GYRO_CAL_MIN_SAMPLES = 30, GYRO_CAL_MAX = 4096 };
-static const double GYRO_CAL_SCATTER = 0.1;     /* rad/s: a sample farther than this from the median means the controller moved */
-static const double GYRO_CAL_MAX_BIAS = 1.05;   /* rad/s (60 deg/s): a larger one is no resting sensor */
-static double cal_bias[3];                      /* rad/s, raw controller frame */
-static int cal_state = GYRO_CAL_IDLE, cal_save;
-static uint64_t cal_ns;                         /* when the current phase began */
-static double cal_buf[GYRO_CAL_MAX][3];
-static uint32_t cal_count;
-static void (*bias_hook)(const double[3]);
-
-void runtime_gyro_bias_hook(void (*fn)(const double bias_rad_s[3])) { pthread_mutex_lock(&lock); bias_hook = fn; pthread_mutex_unlock(&lock); }
-void runtime_gyro_bias_set(const double b[3]) { pthread_mutex_lock(&lock); memcpy(cal_bias, b, sizeof cal_bias); pthread_mutex_unlock(&lock); }
-void runtime_gyro_bias_get(double b[3]) { pthread_mutex_lock(&lock); memcpy(b, cal_bias, sizeof cal_bias); pthread_mutex_unlock(&lock); }
-
-static double norm3(const double v[3]);
-static int cmp_double(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
-static void cal_finish(void) {   /* lock held: the sampling ended */
-    static double col[GYRO_CAL_MAX];
-    double med[3], sum[3] = {0, 0, 0}, worst = 0; uint32_t n = cal_count, inliers = 0, outliers;
-    if (n < GYRO_CAL_MIN_SAMPLES) { cal_state = GYRO_CAL_NO_DATA; fprintf(stderr, "[gyro] calibration failed (no sensor data): %u samples\n", n); return; }
-    for (int a = 0; a < 3; a++) {
-        for (uint32_t i = 0; i < n; i++) col[i] = cal_buf[i][a];
-        qsort(col, n, sizeof *col, cmp_double); med[a] = col[n / 2];
-    }
-    for (uint32_t i = 0; i < n; i++) {
-        double d[3] = {cal_buf[i][0] - med[0], cal_buf[i][1] - med[1], cal_buf[i][2] - med[2]}, dn = norm3(d);
-        if (dn > worst) worst = dn;
-        if (dn <= GYRO_CAL_SCATTER) { for (int a = 0; a < 3; a++) sum[a] += cal_buf[i][a]; inliers++; }
-    }
-    outliers = n - inliers;
-    double mean[3] = {inliers ? sum[0] / inliers : 0, inliers ? sum[1] / inliers : 0, inliers ? sum[2] / inliers : 0};
-    if (!inliers || outliers > (n / 10 > 1 ? n / 10 : 1)) {
-        cal_state = GYRO_CAL_MOVED;
-        fprintf(stderr, "[gyro] calibration failed (controller moved): %u samples, %u scattered over %.2f deg/s from the median (%+.3f %+.3f %+.3f) deg/s, farthest %.2f deg/s\n",
-                n, outliers, GYRO_CAL_SCATTER * 180 / M_PI, med[0] * 180 / M_PI, med[1] * 180 / M_PI, med[2] * 180 / M_PI, worst * 180 / M_PI);
-    } else if (norm3(mean) > GYRO_CAL_MAX_BIAS) {
-        cal_state = GYRO_CAL_NO_DATA;
-        fprintf(stderr, "[gyro] calibration failed (no resting sensor): the mean is %.1f deg/s\n", norm3(mean) * 180 / M_PI);
-    } else {
-        memcpy(cal_bias, mean, sizeof cal_bias); cal_state = GYRO_CAL_DONE; cal_save = 1;
-        fprintf(stderr, "[gyro] calibrated from %u of %u samples: bias (%+.4f %+.4f %+.4f) deg/s\n", inliers, n,
-                cal_bias[0] * 180 / M_PI, cal_bias[1] * 180 / M_PI, cal_bias[2] * 180 / M_PI);
-    }
-}
-static void cal_tick(uint64_t now) {   /* lock held: phases follow the clock, whether or not samples arrive */
-    if (cal_state == GYRO_CAL_COUNTDOWN && now - cal_ns >= GYRO_CAL_COUNTDOWN_S * 1000000000ull) { cal_state = GYRO_CAL_SAMPLING; cal_ns = now; cal_count = 0; }
-    if (cal_state == GYRO_CAL_SAMPLING && now - cal_ns >= GYRO_CAL_SAMPLE_S * 1000000000ull) { cal_ns = now; cal_finish(); }
-    if ((cal_state == GYRO_CAL_DONE || cal_state == GYRO_CAL_MOVED || cal_state == GYRO_CAL_NO_DATA) && now - cal_ns >= GYRO_CAL_RESULT_S * 1000000000ull)
-        cal_state = GYRO_CAL_IDLE;
-}
-static void cal_flush(void) {   /* no lock held: hands a new bias to the saver */
-    double b[3]; void (*fn)(const double[3]) = 0;
-    pthread_mutex_lock(&lock);
-    if (cal_save) { cal_save = 0; memcpy(b, cal_bias, sizeof b); fn = bias_hook; }
-    pthread_mutex_unlock(&lock);
-    if (fn) fn(b);
-}
-void runtime_gyro_cal_start(void) {
-    pthread_mutex_lock(&lock); cal_state = GYRO_CAL_COUNTDOWN; cal_ns = runtime_now_ns(); pthread_mutex_unlock(&lock);
-    fprintf(stderr, "[gyro] calibration: lay the controller still, %d s countdown\n", GYRO_CAL_COUNTDOWN_S);
-}
-void runtime_gyro_cal_cancel(void) { pthread_mutex_lock(&lock); cal_state = GYRO_CAL_IDLE; pthread_mutex_unlock(&lock); }
-void runtime_gyro_bias_clear(void) {
-    pthread_mutex_lock(&lock); memset(cal_bias, 0, sizeof cal_bias); cal_state = GYRO_CAL_IDLE; cal_save = 1; pthread_mutex_unlock(&lock);
-    cal_flush();
-}
-/* The phase, and in seconds_left what remains of the countdown or the sampling. */
-int runtime_gyro_cal_state(double *seconds_left) {
-    pthread_mutex_lock(&lock);
-    uint64_t now = runtime_now_ns(); cal_tick(now);
-    int st = cal_state;
-    if (seconds_left) {
-        double length = st == GYRO_CAL_COUNTDOWN ? GYRO_CAL_COUNTDOWN_S : st == GYRO_CAL_SAMPLING ? GYRO_CAL_SAMPLE_S : 0;
-        double left = length - (now - cal_ns) / 1e9; *seconds_left = left > 0 ? left : 0;
-    }
-    pthread_mutex_unlock(&lock);
-    cal_flush();
-    return st;
-}
 
 /* TOTK_GYRO_AXES: reference axis i = sign * controller axis from[i]. 0 if unset, -1 if malformed. */
 int runtime_motion_axes(const char *spec) {
@@ -277,12 +189,7 @@ static void bias_sample(const double acc[3], const double gyro[3], uint64_t now)
 void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint64_t now) {
     double acc[3], gyro[3];
     pthread_mutex_lock(&lock);
-    cal_tick(runtime_now_ns());
-    if (cal_state == GYRO_CAL_SAMPLING && cal_count < GYRO_CAL_MAX) { memcpy(cal_buf[cal_count], raw_gyro, sizeof cal_buf[0]); cal_count++; }
-    for (int i = 0; i < 3; i++) {
-        acc[i] = sign[i] * raw_acc[from[i]];
-        gyro[i] = det * sign[i] * (raw_gyro[from[i]] - cal_bias[from[i]]);
-    }
+    for (int i = 0; i < 3; i++) { acc[i] = sign[i] * raw_acc[from[i]]; gyro[i] = det * sign[i] * raw_gyro[from[i]]; }
     bias_sample(acc, gyro, now);
     for (int i = 0; i < 3; i++) gyro[i] -= bias[i];
     if (deadzone < 0) {
@@ -293,10 +200,9 @@ void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint
     }
     double rate = norm3(gyro), keep = rate > deadzone ? (rate - deadzone) / rate : 0;
     for (int i = 0; i < 3; i++) gyro[i] *= keep;
-    if (mouse_owns) { pthread_mutex_unlock(&lock); cal_flush(); return; }
+    if (mouse_owns) { pthread_mutex_unlock(&lock); return; }
     feed_locked(acc, gyro, now);
     pthread_mutex_unlock(&lock);
-    cal_flush();
 }
 /* One sample in the reference controller frame (lock held). */
 static void feed_locked(const double acc[3], const double gyro[3], uint64_t now) {
