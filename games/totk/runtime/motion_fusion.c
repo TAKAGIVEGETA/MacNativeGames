@@ -22,6 +22,13 @@
    HID reports (runtime_motion_deadzone_default, gamepad_feedback.m): an 8BitDo Pro Controller lying on the desk read
    0.83 deg/s on average (bias 0.05, 0.73, 0.38 deg/s after its factory calibration), at most 1.07 deg/s, in 616 samples,
    enough for the aim to creep; a DualSense through GameController needs none.
+   Gyro bias at rest (2026-10-28): a controller's factory calibration can leave its gyro well off zero. A third-party
+   Pro Controller over HID has gyro origin 0 0 0 in its SPI calibration and reads about +10.3 +5.8 -0.7 deg/s lying
+   still, ten times the dead zone, so a drawn bow's aim keeps turning. The bias is learned whenever the controller lies
+   still -- one second in which no axis's rate spreads over 3 deg/s or averages over 30 deg/s, and the acceleration
+   spreads over no more than 0.04 G and is within 0.1 G of 1 G -- and taken off every sample before the dead zone (the
+   first still second sets it, later ones move it 30 % of the way; a well-calibrated controller learns about zero).
+   TOTK_GYRO_BIAS="x,y,z" (deg/s, in the axes the [gyro] log prints) fixes it instead; TOTK_GYRO_BIAS=0 turns it off.
    Mouse mode (Mac, key 7: runtime/gamepad.m, runtime/mouse_look.h): the mouse takes the sensor over. Its samples come in
    this frame already (runtime_motion_feed_mouse: no TOTK_GYRO_AXES remap, no dead zone), the controller's are dropped
    meanwhile, and with mouse mode off the controller has it back (from a fresh start). The mouse's rate has no bias, so
@@ -54,12 +61,18 @@ static int from[3] = {0, 1, 2};
 static double sign[3] = {1, 1, 1}, det = 1;
 static double deadzone = -1;   /* rad/s; -1 until read from TOTK_GYRO_DEADZONE */
 static double deadzone_default;   /* deg/s, when TOTK_GYRO_DEADZONE is unset */
+/* gyro bias at rest (see the head comment) */
+static double bias[3], bias_logged[3];   /* rad/s */
+static int bias_mode = -1, bias_known;   /* mode: -1 unread, 0 off, 1 learned, 2 fixed */
+static uint64_t win_start, win_last;
+static int win_n;
+static double win_g[3], win_a[3], win_gmin[3], win_gmax[3], win_amin[3], win_amax[3];
 static int mouse_owns, controller_live, phone_live;
 
 enum { GYRO_CAL_COUNTDOWN_S = 5, GYRO_CAL_SAMPLE_S = 3, GYRO_CAL_RESULT_S = 8, GYRO_CAL_MIN_SAMPLES = 30, GYRO_CAL_MAX = 4096 };
 static const double GYRO_CAL_SCATTER = 0.1;     /* rad/s: a sample farther than this from the median means the controller moved */
 static const double GYRO_CAL_MAX_BIAS = 1.05;   /* rad/s (60 deg/s): a larger one is no resting sensor */
-static double bias[3];                          /* rad/s, raw controller frame */
+static double cal_bias[3];                      /* rad/s, raw controller frame */
 static int cal_state = GYRO_CAL_IDLE, cal_save;
 static uint64_t cal_ns;                         /* when the current phase began */
 static double cal_buf[GYRO_CAL_MAX][3];
@@ -67,8 +80,8 @@ static uint32_t cal_count;
 static void (*bias_hook)(const double[3]);
 
 void runtime_gyro_bias_hook(void (*fn)(const double bias_rad_s[3])) { pthread_mutex_lock(&lock); bias_hook = fn; pthread_mutex_unlock(&lock); }
-void runtime_gyro_bias_set(const double b[3]) { pthread_mutex_lock(&lock); memcpy(bias, b, sizeof bias); pthread_mutex_unlock(&lock); }
-void runtime_gyro_bias_get(double b[3]) { pthread_mutex_lock(&lock); memcpy(b, bias, sizeof bias); pthread_mutex_unlock(&lock); }
+void runtime_gyro_bias_set(const double b[3]) { pthread_mutex_lock(&lock); memcpy(cal_bias, b, sizeof cal_bias); pthread_mutex_unlock(&lock); }
+void runtime_gyro_bias_get(double b[3]) { pthread_mutex_lock(&lock); memcpy(b, cal_bias, sizeof cal_bias); pthread_mutex_unlock(&lock); }
 
 static double norm3(const double v[3]);
 static int cmp_double(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
@@ -95,9 +108,9 @@ static void cal_finish(void) {   /* lock held: the sampling ended */
         cal_state = GYRO_CAL_NO_DATA;
         fprintf(stderr, "[gyro] calibration failed (no resting sensor): the mean is %.1f deg/s\n", norm3(mean) * 180 / M_PI);
     } else {
-        memcpy(bias, mean, sizeof bias); cal_state = GYRO_CAL_DONE; cal_save = 1;
+        memcpy(cal_bias, mean, sizeof cal_bias); cal_state = GYRO_CAL_DONE; cal_save = 1;
         fprintf(stderr, "[gyro] calibrated from %u of %u samples: bias (%+.4f %+.4f %+.4f) deg/s\n", inliers, n,
-                bias[0] * 180 / M_PI, bias[1] * 180 / M_PI, bias[2] * 180 / M_PI);
+                cal_bias[0] * 180 / M_PI, cal_bias[1] * 180 / M_PI, cal_bias[2] * 180 / M_PI);
     }
 }
 static void cal_tick(uint64_t now) {   /* lock held: phases follow the clock, whether or not samples arrive */
@@ -109,7 +122,7 @@ static void cal_tick(uint64_t now) {   /* lock held: phases follow the clock, wh
 static void cal_flush(void) {   /* no lock held: hands a new bias to the saver */
     double b[3]; void (*fn)(const double[3]) = 0;
     pthread_mutex_lock(&lock);
-    if (cal_save) { cal_save = 0; memcpy(b, bias, sizeof b); fn = bias_hook; }
+    if (cal_save) { cal_save = 0; memcpy(b, cal_bias, sizeof b); fn = bias_hook; }
     pthread_mutex_unlock(&lock);
     if (fn) fn(b);
 }
@@ -119,7 +132,7 @@ void runtime_gyro_cal_start(void) {
 }
 void runtime_gyro_cal_cancel(void) { pthread_mutex_lock(&lock); cal_state = GYRO_CAL_IDLE; pthread_mutex_unlock(&lock); }
 void runtime_gyro_bias_clear(void) {
-    pthread_mutex_lock(&lock); memset(bias, 0, sizeof bias); cal_state = GYRO_CAL_IDLE; cal_save = 1; pthread_mutex_unlock(&lock);
+    pthread_mutex_lock(&lock); memset(cal_bias, 0, sizeof cal_bias); cal_state = GYRO_CAL_IDLE; cal_save = 1; pthread_mutex_unlock(&lock);
     cal_flush();
 }
 /* The phase, and in seconds_left what remains of the countdown or the sampling. */
@@ -219,12 +232,59 @@ static void produce_until(uint64_t t) {   /* lock held: 5 ms states at the held 
     for (int n = 0; emit_ns + step <= t && n < 64; n++) { integrate(cur_gyro, cur_acc, step / 1e9); push_state(step / 1e9); emit_ns += step; }
 }
 static void feed_locked(const double acc[3], const double gyro[3], uint64_t now);
+static void bias_sample(const double acc[3], const double gyro[3], uint64_t now) {   /* lock held */
+    const double d = 180 / M_PI;
+    if (bias_mode < 0) {
+        const char *e = getenv("TOTK_GYRO_BIAS"); double v[3]; int used = 0;
+        bias_mode = 1;
+        if (e && !strcmp(e, "0")) { bias_mode = 0; fprintf(stderr, "[gyro] bias correction off (TOTK_GYRO_BIAS=0)\n"); }
+        else if (e) {
+            if (sscanf(e, "%lf,%lf,%lf%n", &v[0], &v[1], &v[2], &used) != 3 || e[used]) runtime_fail("TOTK_GYRO_BIAS must be 0 or \"x,y,z\" in degrees a second");
+            for (int i = 0; i < 3; i++) bias[i] = v[i] / d;
+            bias_mode = 2; bias_known = 1;
+            fprintf(stderr, "[gyro] bias %+.2f %+.2f %+.2f deg/s (TOTK_GYRO_BIAS)\n", v[0], v[1], v[2]);
+        }
+    }
+    if (bias_mode != 1) return;
+    if (!win_n || now < win_last || now - win_last > 100000000ull) {   /* a fresh window (first sample, or after a gap) */
+        win_n = 0; win_start = now;
+        for (int i = 0; i < 3; i++) { win_g[i] = win_a[i] = 0; win_gmin[i] = win_gmax[i] = gyro[i]; win_amin[i] = win_amax[i] = acc[i]; }
+    }
+    win_last = now; win_n++;
+    for (int i = 0; i < 3; i++) {
+        win_g[i] += gyro[i]; win_a[i] += acc[i];
+        win_gmin[i] = fmin(win_gmin[i], gyro[i]); win_gmax[i] = fmax(win_gmax[i], gyro[i]);
+        win_amin[i] = fmin(win_amin[i], acc[i]); win_amax[i] = fmax(win_amax[i], acc[i]);
+    }
+    if (now - win_start < 1000000000ull) return;
+    int still = win_n >= 20; double mean[3], a[3];
+    for (int i = 0; i < 3; i++) {
+        mean[i] = win_g[i] / win_n; a[i] = win_a[i] / win_n;
+        if ((win_gmax[i] - win_gmin[i]) * d > 3 || win_amax[i] - win_amin[i] > 0.04 || fabs(mean[i]) * d > 30) still = 0;
+    }
+    if (still && fabs(norm3(a) - 1) < 0.1) {
+        for (int i = 0; i < 3; i++) bias[i] = bias_known ? bias[i] + 0.3 * (mean[i] - bias[i]) : mean[i];
+        double moved = 0; for (int i = 0; i < 3; i++) moved = fmax(moved, fabs(bias[i] - bias_logged[i]) * d);
+        if (!bias_known || moved > 0.3) {
+            fprintf(stderr, "[gyro] bias %s at rest: %+.2f %+.2f %+.2f deg/s (TOTK_GYRO_BIAS=%.2f,%.2f,%.2f would fix it)\n", bias_known ? "updated" : "learned",
+                    bias[0] * d, bias[1] * d, bias[2] * d, bias[0] * d, bias[1] * d, bias[2] * d);
+            memcpy(bias_logged, bias, sizeof bias);
+        }
+        bias_known = 1;
+    }
+    win_n = 0;
+}
 void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint64_t now) {
     double acc[3], gyro[3];
     pthread_mutex_lock(&lock);
     cal_tick(runtime_now_ns());
     if (cal_state == GYRO_CAL_SAMPLING && cal_count < GYRO_CAL_MAX) { memcpy(cal_buf[cal_count], raw_gyro, sizeof cal_buf[0]); cal_count++; }
-    for (int i = 0; i < 3; i++) { acc[i] = sign[i] * raw_acc[from[i]]; gyro[i] = det * sign[i] * (raw_gyro[from[i]] - bias[from[i]]); }
+    for (int i = 0; i < 3; i++) {
+        acc[i] = sign[i] * raw_acc[from[i]];
+        gyro[i] = det * sign[i] * (raw_gyro[from[i]] - cal_bias[from[i]]);
+    }
+    bias_sample(acc, gyro, now);
+    for (int i = 0; i < 3; i++) gyro[i] -= bias[i];
     if (deadzone < 0) {
         const char *e = getenv("TOTK_GYRO_DEADZONE"); double v = deadzone_default;
         if (e) { char *end; v = strtod(e, &end); if (end == e || *end || !(v >= 0) || v > 20) runtime_fail("TOTK_GYRO_DEADZONE must be a number of degrees a second in [0, 20]"); }
@@ -274,8 +334,13 @@ int runtime_motion_read(RuntimeMotionState *out, int max) {
     return n;
 }
 void runtime_motion_start(void) { pthread_mutex_lock(&lock); restart = 1; pthread_mutex_unlock(&lock); }
-/* The dead zone in deg/s when TOTK_GYRO_DEADZONE is unset: the HID reader sets 1.2, a GameController controller 0. */
-void runtime_motion_deadzone_default(double deg) { pthread_mutex_lock(&lock); deadzone_default = deg; deadzone = -1; pthread_mutex_unlock(&lock); }
+/* The dead zone in deg/s when TOTK_GYRO_DEADZONE is unset: the HID reader sets 1.2, a GameController controller 0.
+   Every source change comes through here, so a learned gyro bias starts over: one controller's bias is not another's. */
+void runtime_motion_deadzone_default(double deg) {
+    pthread_mutex_lock(&lock); deadzone_default = deg; deadzone = -1;
+    if (bias_mode == 1) { memset(bias, 0, sizeof bias); memset(bias_logged, 0, sizeof bias_logged); bias_known = 0; win_n = 0; }
+    pthread_mutex_unlock(&lock);
+}
 void runtime_motion_live(int on) {
     pthread_mutex_lock(&lock); controller_live = on; live = controller_live || phone_live || mouse_owns;
     if (on && !mouse_owns) restart = 1; pthread_mutex_unlock(&lock);
