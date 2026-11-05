@@ -136,6 +136,7 @@ int reshade_mode(void);
 void reshade_mode_set(int mode);
 int reshade_enabled(void);
 void reshade_set(int on);
+static void reshade_apply_shortcut(int mode);
 static uint64_t bootStartNS;
 static _Atomic uint64_t presentedFrames;
 static _Atomic int warmPending;
@@ -312,9 +313,16 @@ static int front_modifier_down(NSEvent *e){
  /* AppKit normally handles menu equivalents first. If a Command event reaches
     this view, offer it to the menu rather than turning its key into gameplay. */
  if(e.modifierFlags&NSEventModifierFlagCommand){[NSApp.mainMenu performKeyEquivalent:e];return;}
- if(textEntryOpen)return;if(settingsOpen&&e.keyCode!=18){if(e.keyCode==53)settings_show(0);return;}runtime_input_key(e.keyCode,1);
+ if(textEntryOpen)return;
+ if(e.keyCode==122){reshade_apply_shortcut(0);return;} /* F1: Off */
+ if(e.keyCode==120){reshade_apply_shortcut(1);return;} /* F2: Reshade Of All Time */
+ if(e.keyCode==99) {reshade_apply_shortcut(2);return;} /* F3: ToTK Remastered */
+ if(settingsOpen&&e.keyCode!=18){if(e.keyCode==53)settings_show(0);return;}runtime_input_key(e.keyCode,1);
 }
--(void)keyUp:(NSEvent *)e{runtime_input_key(e.keyCode,0);}
+-(void)keyUp:(NSEvent *)e{
+ if(e.keyCode==122||e.keyCode==120||e.keyCode==99)return;
+ runtime_input_key(e.keyCode,0);
+}
 /* Shift, Control and Option, left and right apart, are keys of the layout (keyboard_map.h); they come as flag changes.
    While the settings panel or text entry is open only their releases go through. */
 -(void)flagsChanged:(NSEvent *)e{
@@ -644,6 +652,17 @@ static void screenshot_picture(void (^cb)(CGImageRef img)) { if (mtl_grab_next_p
 #endif
 #include "screenshot.h"
 #include "settings_panel.h"
+static void reshade_apply_shortcut(int mode) {
+ reshade_mode_set(mode);
+ char word[16]; snprintf(word, sizeof word, "%d", mode);
+ runtime_setting_save("graphics-reshade.txt", word, "color filter preset");
+ NSString *name = (mode == 1) ? @"Reshade Of All Time" : (mode == 2 ? @"ToTK Remastered" : @(TOTK_UI("关闭", "Off")));
+ NSString *toast = [NSString stringWithFormat:@(TOTK_UI("画质滤镜：%@ (F%d)", "Color Filter: %@ (F%d)")), name, mode == 0 ? 1 : (mode == 1 ? 2 : 3)];
+#if defined(TOTK_SCREENSHOT_WINDOW)
+ screenshot_note(toast, NO);
+#endif
+ fprintf(stderr, "[reshade] key F%d: %s\n", mode == 0 ? 1 : (mode == 1 ? 2 : 3), name.UTF8String);
+}
 void runtime_front_resize_output(unsigned w,unsigned h) {
  dispatch_async(dispatch_get_main_queue(),^{settings_window_size(w,h,h?(double)w/h:0);});
 }
