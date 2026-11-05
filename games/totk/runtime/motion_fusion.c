@@ -236,10 +236,11 @@ static void bias_sample(const double acc[3], const double gyro[3], uint64_t now)
     const double d = 180 / M_PI;
     if (bias_mode < 0) {
         const char *e = getenv("TOTK_GYRO_BIAS"); double v[3]; int used = 0;
-        bias_mode = 1;
-        if (e && !strcmp(e, "0")) { bias_mode = 0; fprintf(stderr, "[gyro] bias correction off (TOTK_GYRO_BIAS=0)\n"); }
+        bias_mode = 0;   /* default 0 (off): disabled to avoid conflict with manual calibration */
+        if (e && !strcmp(e, "auto")) { bias_mode = 1; fprintf(stderr, "[gyro] automatic resting bias learning enabled (TOTK_GYRO_BIAS=auto)\n"); }
+        else if (e && !strcmp(e, "0")) { bias_mode = 0; fprintf(stderr, "[gyro] bias correction off (TOTK_GYRO_BIAS=0)\n"); }
         else if (e) {
-            if (sscanf(e, "%lf,%lf,%lf%n", &v[0], &v[1], &v[2], &used) != 3 || e[used]) runtime_fail("TOTK_GYRO_BIAS must be 0 or \"x,y,z\" in degrees a second");
+            if (sscanf(e, "%lf,%lf,%lf%n", &v[0], &v[1], &v[2], &used) != 3 || e[used]) runtime_fail("TOTK_GYRO_BIAS must be 0, \"auto\" or \"x,y,z\" in degrees a second");
             for (int i = 0; i < 3; i++) bias[i] = v[i] / d;
             bias_mode = 2; bias_known = 1;
             fprintf(stderr, "[gyro] bias %+.2f %+.2f %+.2f deg/s (TOTK_GYRO_BIAS)\n", v[0], v[1], v[2]);
@@ -283,8 +284,12 @@ void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint
         acc[i] = sign[i] * raw_acc[from[i]];
         gyro[i] = det * sign[i] * (raw_gyro[from[i]] - cal_bias[from[i]]);
     }
-    bias_sample(acc, gyro, now);
-    for (int i = 0; i < 3; i++) gyro[i] -= bias[i];
+    if (bias_mode > 0) {
+        bias_sample(acc, gyro, now);
+        for (int i = 0; i < 3; i++) gyro[i] -= bias[i];
+    } else if (bias_mode < 0) {
+        bias_sample(acc, gyro, now);
+    }
     if (deadzone < 0) {
         const char *e = getenv("TOTK_GYRO_DEADZONE"); double v = deadzone_default;
         if (e) { char *end; v = strtod(e, &end); if (end == e || *end || !(v >= 0) || v > 20) runtime_fail("TOTK_GYRO_DEADZONE must be a number of degrees a second in [0, 20]"); }
