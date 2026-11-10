@@ -52,10 +52,11 @@
                                                              are always the patched ones on the Mac (off: the stock AO,
                                                              bit for bit), so every choice acts at once (user 2026-10-30);
                                                              TOTK_SSAO / _STRENGTH / _RADIUS decide first (greyed out)
-     shadow resolution    as the game has it / 2048 per       Breath of the Wild 1.9.0 (PR #1447): runtime_shadow_res_save
-                          cascade                            (game_patches_botw.c, botw_shadow_res.h), shadows.txt (off or
+     shadow resolution    off / as the game has it / 2048     Breath of the Wild 1.9.0 (PR #1447): runtime_shadow_res_save
+                          per cascade                        (game_patches_botw.c, botw_shadow_res.h), shadows.txt (off or
                                                              2048); the game sizes the map once, so the choice is the next
-                                                             launch's (its title says so); TOTK_SHADOW_RES decides first
+                                                             launch's (its title says so); TOTK_SHADOW_RES decides first;
+                                                             off is the effect switch "shadow", at once (botw_effects.h)
      model detail distance 1x / 2x / 4x / 10x / 20x / 50x / runtime_lod_scale_set (game_patches_v143.c): the level of
                                                              detail a model gets at a distance is the one it had at
      100x                                                    1/K of it; graphics-lod.txt (x100); TOTK_LOD_SCALE first
@@ -118,6 +119,7 @@
 #include "../zeldaVR/runtime/vr_camera.h"   /* runtime_camera_distance_*: 1.4.3's camera hook, a default elsewhere */
 #include "keyboard_map.h"    /* the keyboard and mouse layout */
 #include "controller_map.h"  /* the controller layout */
+#include "input_prompts.h"
 #include "feedback_settings.h"   /* feedback_word: ssao.txt */
 #include "users.h"           /* the local users (runtime/account.c): the User page */
 #if defined(GAME_DKB) || defined(GAME_POKOPIA)
@@ -548,7 +550,7 @@ static void settings_vr_rows(NSMutableArray<TOTKSettingRow *> *rows) {
  if(!vr_enabled())return;
 #ifdef GAME_BOTW190
  [rows addObject:settings_fixed(settings_text("VR 设置 · 视角","VR · view"),settings_text("第三人称","Third person"))];
-#elif defined(GAME_BOTW)
+#elif defined(GAME_BOTW) || defined(TOTK_GAME_V143)
  [rows addObject:settings_row(settings_text("VR 设置 · 视角","VR · view"),@[settings_text("第三人称","Third person"),settings_text("第一人称","First person")],@[@0,@1],
   ^int{return vr_first_person();},^(int v){vr_set_first_person(v);})];
 #else
@@ -566,7 +568,7 @@ static void settings_vr_rows(NSMutableArray<TOTKSettingRow *> *rows) {
   settings_text("摄像头 左右（厘米）","Camera right / left (cm)")];
  for(int a=0;a<3;a++){TOTKSettingRow *r=settings_row(axes[(NSUInteger)a],nil,nil,^int{return vr_offset_cm(a);},^(int v){vr_set_offset_cm(a,v);});
   r.sliderMin=-100;r.sliderMax=100;[rows addObject:r];}
-#ifndef GAME_BOTW
+#if !defined(GAME_BOTW) && !defined(TOTK_GAME_V143)
  /* What the Mac window shows (user 2026-10-29: "屏幕 显示 类似vr 那种 两个屏幕"): both eyes as the headset gets them, or the game's picture. */
  /* "显示 Quest 画面" (user 2026-10-30: "桌面显示 和 quest里面 一样的画面 设置里加一个 按钮 叫 显示quest画面"): the Mac window shows
     both eyes; on, each inside its lens opening as in the headset; off, uncovered ("就是 不遮挡状态"). */
@@ -583,7 +585,7 @@ static void settings_vr_rows(NSMutableArray<TOTKSettingRow *> *rows) {
  [rows addObject:settings_row(settings_text("体感操作（挥剑、举盾、拉弓、手势）","Motion controls (swing, shield, bow, gestures)"),nil,nil,^int{return vr_motion();},^(int v){vr_set_motion(v);})];
  [rows addObject:settings_row(settings_text("转身方式","Turning"),@[settings_text("平滑","Smooth"),settings_text("分段（小）","Snap (small)"),settings_text("分段（中）","Snap (medium)"),settings_text("分段（大）","Snap (large)")],
   @[@0,@120,@200,@300],^int{return vr_snap_ms();},^(int v){vr_set_snap_ms(v);})];
-#if defined(GAME_BOTW160)
+#if defined(GAME_BOTW160) || defined(TOTK_GAME_V143)
  static const int sizes[][2]={{1280,1380},{1536,1656},{1792,1932},{2048,2208},{2560,2760},{3072,3312},{3584,3864},{4096,4416}};
  NSArray<NSString *> *names=@[@"0.625×　1280×1380",@"0.75×　1536×1656",@"0.875×　1792×1932",@"1.0×　2048×2208",@"1.25×　2560×2760",@"1.5×　3072×3312",@"1.75×　3584×3864",@"2.0×　4096×4416"];
 #else
@@ -594,7 +596,7 @@ static void settings_vr_rows(NSMutableArray<TOTKSettingRow *> *rows) {
   @"2048×2208"];
 #endif
  NSString *title=settings_text("VR 设置 · 分辨率（每眼）","VR · resolution (per eye)");
-#if defined(GAME_BOTW160)
+#if defined(GAME_BOTW160) || defined(TOTK_GAME_V143)
  title=settings_text("渲染分辨率（每眼，立即生效）","Render resolution (per eye, immediate)");
  int stream_w=0,stream_h=0;vr_stream_resolution(&stream_w,&stream_h);
  [rows addObject:settings_fixed(settings_text("串流分辨率（每眼）","Stream resolution (per eye)"),
@@ -770,8 +772,9 @@ static void settings_effects_reset(void) {
 #endif
  fprintf(stderr,"[totk] settings: the effects page back to the defaults\n");
 }
-/* Sun shadows (Breath of the Wild 1.9.0, botw_shadow_res.h): the game's sizes or 2048 per cascade. The game sizes its map
-   once, at the start, so the row shows and saves the next launch's choice, never this run's. Where the patch does not act
+/* Sun shadows (Breath of the Wild 1.9.0, botw_shadow_res.h): off, the game's sizes or 2048 per cascade. The game sizes its
+   map once, at the start, so for the sizes the row shows and saves the next launch's choice, never this run's; off acts at
+   once (P9, 2026-11-05: on the Great Plateau the shadows of Link, rocks and cliffs go, with no other evident fault in that scene; AO and other conditions not checked). Where the patch does not act
    (the iOS export's run) the row offers nothing to save. On the effects page of the other versions (TOTK 1.4.3 has its own). */
 #ifndef TOTK_GAME_V143
 static TOTKSettingRow *settings_botw_shadow_row(void) {
@@ -779,11 +782,7 @@ static TOTKSettingRow *settings_botw_shadow_row(void) {
 #ifndef GAME_BOTW190
  return settings_fixed(t,settings_text("这个版本没有","Not in this version"));
 #else
- if(!runtime_shadow_res_available())return settings_fixed(t,settings_text("这个版本没有","Not in this version"));
- if(runtime_shadow_res_locked())return settings_fixed(t,settings_text("由 TOTK_SHADOW_RES 设置","Set by TOTK_SHADOW_RES"));
- t=[t stringByAppendingString:settings_text("（下次启动生效）"," (from the next launch)")];
- return settings_row(t,@[settings_text("游戏原样","As the game has it"),settings_text("2048（每级）","2048 per cascade")],@[@0,@2048],
-  ^int{return runtime_shadow_res_saved();},^(int v){runtime_shadow_res_save(v);});
+ return settings_botw190_shadow_row(t);   /* botw_effects.h */
 #endif
 }
 /* The field of view (Breath of the Wild 1.9.0, botw_fov.h): as 1.4.3's row, in hundredths of the game's own, at once; from
@@ -921,6 +920,7 @@ static NSArray<TOTKSettingRow *> *settings_rows(void) {
     runtime_front_resize_aspect(r);char word[32];snprintf(word,sizeof word,"%.8g",r);runtime_setting_save("graphics-aspect.txt",word,"aspect ratio");
 #endif
    }})];}
+ }
  NSArray<NSString *> *reshade_choices = @[settings_text("关闭","Off"), @"Reshade Of All Time", @"ToTK Remastered"];
  NSArray<NSNumber *> *reshade_values = @[@0, @1, @2];
  if(getenv("TOTK_RESHADE")) {
@@ -937,6 +937,12 @@ static NSArray<TOTKSettingRow *> *settings_rows(void) {
   @[@(GAMEPAD_TYPE_AUTO),@(GAMEPAD_TYPE_XBOX),@(GAMEPAD_TYPE_PLAYSTATION),@(GAMEPAD_TYPE_SWITCH)],
   ^int{return runtime_gamepad_type(NULL);},^(int v){runtime_gamepad_type_set(v);});
  pad.firstTitle=^NSString *{return settings_pad_auto_text();};[rows addObject:pad];
+#if defined(TOTK_GAME_V143)
+ [rows addObject:settings_row(settings_text("按键提示图标","Button prompts"),
+  @[settings_text("自动","Auto"),settings_text("键盘和鼠标","Keyboard / mouse"),@"Xbox",@"PlayStation",@"Switch",settings_text("关闭（游戏原图标）","Off (the game's icons)")],
+  @[@(PROMPT_AUTO),@(PROMPT_KEYBOARD),@(PROMPT_XBOX),@(PROMPT_PLAYSTATION),@(PROMPT_SWITCH),@(PROMPT_STYLE_OFF)],
+  ^int{return runtime_prompt_style();},^(int v){runtime_prompt_style_set(v);})];
+#endif
  [rows addObject:settings_row(settings_text("后台手柄输入","Controller input in background"),nil,nil,
   ^int{return runtime_gamepad_background_enabled();},^(int v){runtime_gamepad_background_set(v);})];
  NSString *bow=settings_text("DualSense 拉弓扳机（R2）","DualSense bow trigger (R2)");

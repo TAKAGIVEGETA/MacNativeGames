@@ -197,6 +197,18 @@ void runtime_feedback_choose(int gyro, int on) { fakeFeedback[gyro] = !!on; }
 int runtime_rumble_gain_locked(void) { return fakeGainLocked; }
 float runtime_rumble_gain(void) { return fakeGain; }
 void runtime_rumble_gain_set(float gain) { fakeGain = gain; }
+static int fakeReshadeMode;
+int reshade_mode(void) { return fakeReshadeMode; }
+void reshade_mode_set(int mode) { fakeReshadeMode = mode; }
+int reshade_enabled(void) { return fakeReshadeMode != 0; }
+void reshade_set(int on) { fakeReshadeMode = on ? 1 : 0; }
+void runtime_gyro_cal_start(void) {}
+void runtime_gyro_cal_cancel(void) {}
+int runtime_gyro_cal_state(double *seconds_left) { if (seconds_left) *seconds_left = 0; return GYRO_CAL_IDLE; }
+void runtime_gyro_bias_get(double bias_rad_s[3]) { bias_rad_s[0] = bias_rad_s[1] = bias_rad_s[2] = 0; }
+void runtime_gyro_bias_set(const double bias_rad_s[3]) { (void)bias_rad_s; }
+void runtime_gyro_bias_clear(void) {}
+void runtime_gyro_bias_hook(void (*save)(const double bias_rad_s[3])) { (void)save; }
 /* gfx/nvn/hle_nvn.c's frame lock (its pacing is checked by probe-gfx's present-interval probe). */
 static int fakeLock;
 void nvn_fps_lock_set(int fps) { if (totk_fps_limit_valid(fps)) fakeLock = fps; }
@@ -274,6 +286,27 @@ static void window_is(CGFloat h) {
 static void shaped(double ratio) {
     NSSize now = window.contentView.bounds.size;
     if (fabs(now.width / now.height - ratio) > 0.01) { fprintf(stderr, "window %.0fx%.0f, expected ratio %.3f\n", now.width, now.height, ratio); abort(); }
+}
+static void rows_fit(void) {
+    /* Short windows compress rows, then scroll: check their actual geometry instead of assuming the default height. */
+    assert(NSContainsRect(window.contentView.bounds, settingsPanel.frame));
+    for (NSInteger page = 0; page < SETTINGS_PAGE_BINDINGS; page++) {
+        NSView *view = settingsPanel.pages[(NSUInteger)page], *document = view;
+        assert(NSContainsRect(settingsPanel.bounds, view.frame));
+        if ([view isKindOfClass:NSScrollView.class]) {
+            NSScrollView *scroll = (NSScrollView *)view;
+            assert(scroll.hasVerticalScroller && scroll.documentView);
+            document = scroll.documentView;
+        }
+        CGFloat previousBottom = NSMaxY(document.bounds);
+        for (TOTKSettingRow *r in settingsPanel.allRows) if (r.page == page) {
+            NSView *band = r.control.superview;
+            assert(band && band.superview == document && band.frame.size.height >= 24);
+            assert(NSContainsRect(document.bounds, band.frame));
+            assert(NSMaxY(band.frame) <= previousBottom);   /* no overlapping rows */
+            previousBottom = NSMinY(band.frame);
+        }
+    }
 }
 static NSEvent *key_down(unsigned short code, NSEventModifierFlags flags) {
     return [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:flags timestamp:0 windowNumber:window.windowNumber
@@ -549,11 +582,15 @@ int main(int argc, const char **argv) { @autoreleasepool {
         NSMutableDictionary<NSString *,TOTKSettingRow *> *byTitle=[NSMutableDictionary dictionary];
         for(TOTKSettingRow *r in rows)byTitle[r.title]=r;
         assert(byTitle[@"VR · view"] && byTitle[@"Stereo · eye distance (%)"]);
-#ifdef GAME_BOTW
+#if defined(GAME_BOTW) || defined(TOTK_GAME_V143)
         assert(!byTitle[@"Show the Quest view"] && !byTitle[@"Mac preview zoom (x)"]);
         assert(!byTitle[@"Head position (6DoF: lean, crouch)"]);
         assert(!byTitle[@"Stereo (the eyes rendered in turn)"]);
+#ifdef GAME_BOTW
         assert(!byTitle[@"First person camera spring (ms, 0 = rigid)"]);
+#else
+        assert(byTitle[@"First person camera spring (ms, 0 = rigid)"]);
+#endif
 #ifdef GAME_BOTW190
         assert(!byTitle[@"VR · view"].set && [byTitle[@"VR · view"].choices isEqualToArray:@[@"Third person"]]);
 #else
@@ -565,7 +602,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
         assert(byTitle[@"Stereo (the eyes rendered in turn)"]);
         assert(byTitle[@"First person camera spring (ms, 0 = rigid)"]);
 #endif
-#ifdef GAME_BOTW160
+#if defined(GAME_BOTW160) || defined(TOTK_GAME_V143)
         assert(([byTitle[@"Render resolution (per eye, immediate)"].choices isEqualToArray:@[@"0.625×　1280×1380",@"0.75×　1536×1656",@"0.875×　1792×1932",@"1.0×　2048×2208",@"1.25×　2560×2760",@"1.5×　3072×3312",@"1.75×　3584×3864",@"2.0×　4096×4416"]]));
         assert(byTitle[@"Stream resolution (per eye)"]&&!byTitle[@"Stream resolution (per eye)"].set);
 #else
@@ -598,12 +635,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
     runtime_input_key_synthetic(18, 1); runtime_input_key_synthetic(18, 1); tick(); runtime_input_key_synthetic(18, 0); tick();
     assert(settingsOpen && fakeSettingsCapture && settingsPanel && !settingsPanel.hidden && settingsPanel.superview == window.contentView);
     assert(NSContainsRect(window.contentView.bounds, settingsPanel.frame));
-    assert(settingsPanel.allRows.count == 28 + 2*TOTK_V143 + BOTW_V190 + (TOTK_V143 && totk_hdr_available() ? SETTINGS_HDR_ROWS : 0));   /* + the HDR rows (PR #1129) */   /* 17 (anisotropy last on the display page, controller
-                                                                 background input on the input page), the user page's
-                                                                 two, then the effects page: FOV, two distances, shadows,
-                                                                 depth of field, FXAA, sharpening and effect switches
-                                                                 (1.4.3, and Breath of the Wild 1.9.0 with its shadow
-                                                                 resolution and AO live), or eight greyed rows */
+    assert(settingsPanel.allRows.count == 30 + 3*TOTK_V143 + BOTW_V190 + (TOTK_V143 && totk_hdr_available() ? SETTINGS_HDR_ROWS : 0));   /* + the HDR rows (PR #1129) + 2 fork rows (ReShade, Gyro calibration) */
 
     /* Native 4K modes as game_patches.c serves them for 1.2.1 (the fixture swaps in a 4K swapchain); off again before
        the rows below read the mode. */
@@ -895,6 +927,18 @@ int main(int argc, const char **argv) { @autoreleasepool {
     pick(@"Controller type", @"Switch"); assert(fakePadType == GAMEPAD_TYPE_SWITCH);
     pick(@"Controller type", @"Auto (PlayStation)"); assert(fakePadType == GAMEPAD_TYPE_AUTO);
     fakePadDetected = -1; shows(@"Controller type", @"Auto (no controller)");
+#if TOTK_V143
+    /* Style changes publish immediately and leave controller routing alone. */
+    shows(@"Button prompts", @"Auto");
+    pick(@"Button prompts", @"PlayStation");
+    PromptBindings prompt;
+    runtime_prompt_snapshot(&prompt); assert(prompt.device == PROMPT_PLAYSTATION);
+    assert(fakePadType == GAMEPAD_TYPE_AUTO);
+    pick(@"Button prompts", @"Keyboard / mouse");
+    runtime_prompt_snapshot(&prompt); assert(prompt.device == PROMPT_KEYBOARD);
+    pick(@"Button prompts", @"Auto");
+#endif
+
 
     assert(!switched(@"Controller input in background"));
     flip(@"Controller input in background", YES); assert(fakePadBackground && switched(@"Controller input in background"));
@@ -924,12 +968,10 @@ int main(int argc, const char **argv) { @autoreleasepool {
            [menu(@"User this run").titleOfSelectedItem isEqualToString:@"Local"]);
     shows(@"User (from the next launch)", @"Local");
     assert(settingsPanel.controllerTargets.count == 3);
-    {   /* The panel is as tall as its tallest page below the key bindings, the user page's two rows included. */
+    {   /* All pages fit, including the user page's two rows. */
         NSUInteger perPage[SETTINGS_PAGES] = {0};
         for (TOTKSettingRow *r in settingsPanel.allRows) perPage[r.page]++;
-        NSUInteger tallest = 0;
-        for (NSInteger page = 0; page < SETTINGS_PAGE_BINDINGS; page++) if (perPage[page] > tallest) tallest = perPage[page];
-        assert(settingsPanel.frame.size.height >= SETTINGS_TOP + tallest * SETTINGS_ROW_H + SETTINGS_BOTTOM - 1);
+        rows_fit();
         assert(perPage[SETTINGS_PAGE_USERS] == 2);
     }
     NSButton *addUser = settingsPanel.userButtons[0];
@@ -977,11 +1019,13 @@ int main(int argc, const char **argv) { @autoreleasepool {
     /* A short window (32:9 on a laptop screen): the rows close up, so the title, the close button and the first row stay in it. */
     NSSize was = window.contentView.bounds.size; press(18); [window setContentSize:NSMakeSize(1728, 486)]; press(18); assert(settingsOpen);
     assert(NSContainsRect(window.contentView.bounds, settingsPanel.frame));
+    rows_fit();
     press(18); [window setContentSize:was]; press(18); assert(settingsOpen);
 #ifdef TOTK_GAME_V143
     /* More effects than fit: both pointer scrolling and controller navigation can reach the top and bottom. */
     press(18);[window setContentSize:NSMakeSize(1728,360)];press(18);[settingsPanel selectPage:SETTINGS_PAGE_EFFECTS];
     assert(NSContainsRect(window.contentView.bounds,settingsPanel.frame));
+    rows_fit();
     NSScrollView *effects=(NSScrollView *)settingsPanel.pages[SETTINGS_PAGE_EFFECTS];
     assert([effects isKindOfClass:NSScrollView.class]&&effects.documentView.bounds.size.height>effects.contentSize.height);
     settingsPanel.controllerIndex=0;
@@ -1017,21 +1061,21 @@ int main(int argc, const char **argv) { @autoreleasepool {
     /* Pages: Display, Input, User and Key bindings; the page shown last opens again. */
     press(18); assert(settingsOpen);
     [settingsPanel selectPage:SETTINGS_PAGE_DISPLAY];
-    assert(settingsPanel.rows.count == 6 && [settingsPanel.rows[0].title isEqualToString:@"Overlay"]);   /* edge smoothing, AO and anisotropy are on the effects page */
+    assert(settingsPanel.rows.count == 7 && [settingsPanel.rows[0].title isEqualToString:@"Overlay"]);   /* edge smoothing, AO and anisotropy are on the effects page */
     /* The display page's bottom right: contribute shaders and star the project, after the rows for a controller; the
        version stays clear of them; a result shows for a moment where the version is. */
     NSButton *contribute = settingsPanel.displayButtons[1], *starButton = settingsPanel.displayButtons[0];
     assert([contribute.title isEqualToString:@"Contribute shaders and pipelines"] && [starButton.title isEqualToString:@"⭐ Star the project"]);
     assert(!contribute.hidden && !starButton.hidden && NSMaxX(contribute.frame) < NSMinX(starButton.frame) && NSMaxX(starButton.frame) <= settingsPanel.frame.size.width - 14);
     assert(NSMaxX(settingsPanel.versionLabel.frame) <= NSMinX(contribute.frame) && contribute.frame.origin.y < 34 && starButton.frame.origin.y < 34);
-    assert(settingsPanel.controllerTargets.count == 8 && settingsPanel.controllerTargets[6] == contribute && settingsPanel.controllerTargets[7] == starButton);
+    assert(settingsPanel.controllerTargets.count == 9 && settingsPanel.controllerTargets[7] == contribute && settingsPanel.controllerTargets[8] == starButton);
     assert(settingsPanel.effectsButtons[0].hidden);   /* "Reset to defaults" only on the effects page */
     NSString *versionText = settingsPanel.versionLabel.stringValue;
     [settingsPanel note:@"Thank you!"]; assert([settingsPanel.versionLabel.stringValue isEqualToString:@"Thank you!"]);
     settingsPanel.versionLabel.stringValue = versionText; settingsPanel.versionLabel.frame = NSMakeRect(18, 9, 230, 16);
     [settingsPanel selectPage:SETTINGS_PAGE_INPUT];
     assert(contribute.hidden && starButton.hidden);   /* the first page only */
-    assert(settingsPanel.rows.count == 9 && !settingsPanel.pages[SETTINGS_PAGE_INPUT].hidden && settingsPanel.pages[SETTINGS_PAGE_DISPLAY].hidden);   /* the screenshot folder last */
+    assert(settingsPanel.rows.count == 10 + TOTK_V143 && !settingsPanel.pages[SETTINGS_PAGE_INPUT].hidden && settingsPanel.pages[SETTINGS_PAGE_DISPLAY].hidden);   /* the screenshot folder last */
     assert(settingsPanel.tabs.selectedSegment == SETTINGS_PAGE_INPUT);
     press(18); press(18); assert(settingsOpen && settingsPanel.page == SETTINGS_PAGE_INPUT);
 

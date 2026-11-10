@@ -194,6 +194,13 @@ void runtime_feedback_choose(int gyro,int on){(void)gyro;(void)on;}
 int runtime_rumble_gain_locked(void){return 0;}
 float runtime_rumble_gain(void){return 1;}
 void runtime_rumble_gain_set(float gain){(void)gain;}
+void runtime_gyro_cal_start(void){}
+void runtime_gyro_cal_cancel(void){}
+int runtime_gyro_cal_state(double *seconds_left){if(seconds_left)*seconds_left=0;return GYRO_CAL_IDLE;}
+void runtime_gyro_bias_get(double bias_rad_s[3]){bias_rad_s[0]=bias_rad_s[1]=bias_rad_s[2]=0;}
+void runtime_gyro_bias_set(const double bias_rad_s[3]){(void)bias_rad_s;}
+void runtime_gyro_bias_clear(void){}
+void runtime_gyro_bias_hook(void (*save)(const double bias_rad_s[3])){(void)save;}
 int runtime_triggers_available(void){return 0;}
 int runtime_triggers_locked(void){return 0;}
 int runtime_triggers_choice(void){return 0;}
