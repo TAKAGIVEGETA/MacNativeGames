@@ -26,11 +26,56 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / 'dev'))
 from game_slot import GameSlot
 
 # Match totk_precise_opts: the invariant position attribute requires this option.
-METAL_FLAGS = [*BASE_METAL_FLAGS, "-fpreserve-invariance"]
+# -fwrapv: SPIR-V, GLSL and the Switch's GPUs wrap on signed overflow; spirv-cross writes signed OpIMul / OpIAdd as plain int
+# arithmetic, where overflow is undefined in MSL and Metal's front end optimizes as if it cannot happen. Ocarina's mesh
+# shader 35785cddc971290c sign-extends a packed 16-bit light-probe coordinate with `as_type<int>(w) * 65536` and a shift;
+# the compiler took the sign from the wrong bits and a wall in the Deku Tree (Gohma's room) was lit brightly. From
+# seedds/nxnative docs/reference/shaders.md "Signed integer overflow in translated shaders" (MIT, PR #1844), which measured
+# no GPU cost. The runtime's own compiles (nvn_mtl.m totk_precise_opts, a variant no library holds) go through
+# MTLCompileOptions, which has no such option: a shader first met in play is compiled without it until the next build.
+METAL_FLAGS = [*BASE_METAL_FLAGS, "-fpreserve-invariance", "-fwrapv"]
 
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+# libraries-verified.json: each library's device, inode, size and modification time with the digest it was checked with.
+# A library still that file keeps the digest instead of being read again (user 2026-11-11 "极速更新": reading 42,891
+# sources and every library took 2 minutes of each update that compiled none). The change time is not compared: packing
+# links the libraries into the app's shader data bundle, which changes their inodes'.
+def lib_identity(path):
+    s = path.stat()
+    return [s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns]
+
+
+def seed_record(seed):
+    """name -> SHA-256 of the seed's files that are still the files its .verified.json recorded (prepare_ns2_seed.py,
+    record_verified): same device, inode, size and modification time. Not the change time: the old seed, removed in the
+    background after a publish, shares these files' inodes, and each link it drops moves their change time."""
+    try:
+        record = json.loads(seed.with_name(seed.name + '.verified.json').read_text())
+        files = record['files'] if record.get('schema') == 1 else {}
+    except (OSError, ValueError, KeyError):
+        return {}
+    out = {}
+    for name, entry in files.items():
+        if not name.endswith('_b.metal') or not isinstance(entry, list) or len(entry) != 6:
+            continue
+        try:
+            if entry[:4] == lib_identity(seed / name):
+                out[name] = entry[5]
+        except OSError:
+            pass
+    return out
+
+
+def recorded_libraries(out):
+    try:
+        record = json.loads((out/'libraries-verified.json').read_text())
+        return record['files'] if record.get('schema') == 1 and isinstance(record.get('files'), dict) else {}
+    except (OSError, ValueError, KeyError):
+        return {}
 
 
 def main():
@@ -71,19 +116,40 @@ def main():
     known = prior.get('files', {}) if prior.get('compiler') == identity else {}
     parser_depths = dict(prior.get('parser_depths', {})) if known else {}
     todo, source_hashes = {}, {}
-    # 42,845 sources and as many libraries are hashed on all cores (one thread took minutes per build).
+    # A source the seed recorded as checked (prepare_ns2_seed.py record_verified) keeps that digest; the rest, and every
+    # library not recorded as unchanged, are hashed on all cores (one thread took minutes per build).
+    seed_known = {}
+    for cache in a.cache:
+        seed_known.update(seed_record(cache))
+    lib_record = recorded_libraries(a.out)
+    read = [0, 0]
     with concurrent.futures.ThreadPoolExecutor(min(16, (os.cpu_count() or 4) * 2)) as pool:
-        source_digests = list(pool.map(digest, sources))
+        def source_digest(src):
+            if seed_known.get(src.name) and src.parent.resolve() in {c.resolve() for c in a.cache}:
+                return seed_known[src.name]
+            read[0] += 1
+            return digest(src)
+        source_digests = list(pool.map(source_digest, sources))
         def lib_ok(sha):
             lib = a.out/f'{sha}.metallib'
-            return lib.is_file() and lib.name in known and digest(lib) == known[lib.name]
+            if not (lib.is_file() and lib.name in known):
+                return False
+            entry = lib_record.get(lib.name)
+            try:
+                if isinstance(entry, list) and len(entry) == 5 and entry[:4] == lib_identity(lib) and entry[4] == known[lib.name]:
+                    return True
+            except OSError:
+                return False
+            read[1] += 1
+            return digest(lib) == known[lib.name]
         unique = sorted(set(source_digests))
         lib_states = dict(zip(unique, pool.map(lib_ok, unique)))
     for src, sha in zip(sources, source_digests):
         source_hashes[src.name] = sha
         if not lib_states[sha]:
             todo.setdefault(sha, src)
-    print(f'{len(sources)} translated shaders, {len(todo)} to compile with {compiler}', flush=True)
+    print(f'{len(sources)} translated shaders, {len(todo)} to compile with {compiler} '
+          f'({read[0]} sources and {read[1]} libraries read; the rest kept the digests recorded with them)', flush=True)
 
     def compile_one(item):
         digest, src = item
@@ -137,6 +203,9 @@ def main():
     partial = manifest.with_suffix('.partial')
     partial.write_text(json.dumps(report, indent=2) + '\n')
     partial.replace(manifest)
+    record = dict(schema=1, files={name: lib_identity(a.out/name) + [sha] for name, sha in sorted(files.items())})
+    (a.out/'libraries-verified.json.tmp').write_text(json.dumps(record, separators=(',', ':')))
+    (a.out/'libraries-verified.json.tmp').replace(a.out/'libraries-verified.json')
     sys.exit(1 if failed else 0)
 
 

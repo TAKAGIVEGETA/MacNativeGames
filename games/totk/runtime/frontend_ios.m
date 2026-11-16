@@ -174,29 +174,38 @@ void runtime_ios_attach_layer(CAMetalLayer *layer,UIView *host){
 #if TARGET_OS_IOS || TARGET_OS_VISION
 #import <Photos/Photos.h>
 extern void mtl_grab_next_present(void (^cb)(CGImageRef img)) __attribute__((weak_import));
-/* The renderer's next frame, for screenshot.h: weak, so a build without the renderer answers with no picture. */
-static void totk_ios_screenshot_picture(void (^cb)(CGImageRef img)) { if (mtl_grab_next_present) mtl_grab_next_present(cb); else cb(NULL); }
+extern void mtl_grab_next_game_frame(void (^cb)(CGImageRef img)) __attribute__((weak_import));
+/* The renderer's next frame -- the game's own, before the output upscale -- for screenshot.h: mtl_grab_next_game_frame
+   first, the window picture when the renderer only offers that; weak, so a build without the renderer answers with no
+   picture. */
+static void totk_ios_screenshot_picture(void (^cb)(CGImageRef img)) {
+    if (mtl_grab_next_game_frame) mtl_grab_next_game_frame(cb);
+    else if (mtl_grab_next_present) mtl_grab_next_present(cb);
+    else cb(NULL);
+}
 #define TOTK_SCREENSHOT_PICTURE totk_ios_screenshot_picture
 #endif
 #include "screenshot.h"   /* the album is GAME_NAME (game_version.h): the game whose frame it is */
 
 #if TARGET_OS_IOS || TARGET_OS_VISION
 /* Photos' permission, asked once and waited for here -- the screenshot queue, never the main queue: the player sees the
-   system's prompt the first time (NSPhotoLibraryAddUsageDescription, project.yml) and the answer holds. 1 when adding
-   pictures is allowed; a refusal or a restriction keeps the note's existing reason (SHOT_NO_PHOTOS). */
+   system's prompt the first time (NSPhotoLibraryUsageDescription, project.yml) and the answer holds. Album lookup needs
+   read/write access; limited or previously granted add-only access can still save directly to Photos. Returns 1 when
+   adding pictures is allowed; a refusal or restriction keeps the note's existing reason (SHOT_NO_PHOTOS). */
 static int screenshot_photos_allowed(void) {
-    PHAuthorizationStatus status = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly];
+    PHAuthorizationStatus status = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite];
     if (status == PHAuthorizationStatusNotDetermined) {
         dispatch_semaphore_t asked = dispatch_semaphore_create(0);
         __block PHAuthorizationStatus answer = status;
-        [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelAddOnly handler:^(PHAuthorizationStatus granted) {
+        [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelReadWrite handler:^(PHAuthorizationStatus granted) {
             answer = granted;
             dispatch_semaphore_signal(asked);
         }];
         dispatch_semaphore_wait(asked, dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_SEC));   /* the player's answer */
         status = answer;
     }
-    return status == PHAuthorizationStatusAuthorized;
+    return status == PHAuthorizationStatusAuthorized || status == PHAuthorizationStatusLimited
+        || [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly] == PHAuthorizationStatusAuthorized;
 }
 #endif
 
@@ -219,8 +228,11 @@ __attribute__((unused)) static int screenshot_save(CGImageRef img, const char *g
     UIImage *picture = [UIImage imageWithCGImage:img];
     if (!picture) { *why = TOTK_UI("无法编码图片", "picture not encoded"); return 0; }
     NSString *title = @(TOTK_SCREENSHOT_ALBUM);   /* the running game's own name: the note and the panel's row say it too */
+    /* An album fetch requires full read access. Limited/add-only grants save the screenshot without reading albums. */
+    BOOL intoAlbum = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite] == PHAuthorizationStatusAuthorized;
     __block NSError *failure = nil;
     [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
+        if (!intoAlbum) { (void)[PHAssetChangeRequest creationRequestForAssetFromImage:picture]; return; }
         PHAssetCollection *collection = nil;
         PHFetchResult<PHAssetCollection *> *found = [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeAlbum
                                                                                              subtype:PHAssetCollectionSubtypeAny
@@ -237,6 +249,7 @@ __attribute__((unused)) static int screenshot_save(CGImageRef img, const char *g
         /* The album could not be made or written (the library's own checks differ per version): the picture still goes in. */
         fprintf(stderr, "[totk] screenshot: the album was refused (%s); saving to the library itself\n", failure.localizedDescription.UTF8String);
         failure = nil;
+        intoAlbum = NO;
         [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
             (void)[PHAssetChangeRequest creationRequestForAssetFromImage:picture];
         } error:&failure];
@@ -246,7 +259,7 @@ __attribute__((unused)) static int screenshot_save(CGImageRef img, const char *g
         *problem = SHOT_NO_PHOTOS; *why = screenshot_problem_text(*problem);
         return 0;
     }
-    snprintf(album, album_size, "%s", TOTK_SCREENSHOT_ALBUM);
+    snprintf(album, album_size, "%s", intoAlbum ? TOTK_SCREENSHOT_ALBUM : TOTK_UI("照片图库", "Photo Library"));
     return 1;
 }
 #endif
