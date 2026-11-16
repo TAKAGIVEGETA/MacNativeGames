@@ -295,6 +295,7 @@ static void settings_restore_begin(void) {
  {extern void netbp_set_flag(int);if(!getenv("OOT_NET_BYPASS")&&settings_read_int("graphics-net-bypass.txt",&v)&&(v==0||v==1))netbp_set_flag(v);}
  {extern void runtime_operation_mode_choose(int,int);if(!getenv("TOTK_OPERATION_MODE")&&!(settings_read_int("graphics-profile.txt",&v)&&v==0))runtime_operation_mode_choose(0,0);}   /* no choice saved: the handheld quality profile (user 2026-11-10, after comparing in the panel) */   /* the handheld quality profile, before the guest starts */
  {extern void netbp_copy_set_flag(int);if(!getenv("OOT_NET_COPY")&&settings_read_int("graphics-net-copy.txt",&v)&&(v==0||v==1))netbp_copy_set_flag(v);}
+ {extern void runtime_qo_async_set(int);if(!getenv("OOT_QO_ASYNC")){if(settings_read_int("graphics-async-replay.txt",&v)&&(v==0||v==1))runtime_qo_async_set(v);else runtime_qo_async_set(1);}}   /* replays on the queue-order thread: the frame stops waiting for its own replay (PR #2132, default on) */
  {int c=settings_oot_canvas_saved();   /* no choice saved: 1, 720p native (user 2026-11-10: "默认 用 掌机， 跳过 收尾网络 720原生"; it was 2, 1080p from 720p, since 2026-11-09); 6, 7: a 4K canvas, not offered until the game has the memory for it; 9: no longer listed */
  settingsOotCanvas=c;runtime_oot_canvas_set(c,0);dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1.5*NSEC_PER_SEC)),dispatch_get_main_queue(),^{settings_oot_window_sync();});}
 #endif
@@ -461,6 +462,25 @@ static TOTKSettingRow *settings_feedback_row(int gyro) {
  if(runtime_feedback_locked(gyro))return settings_fixed(t,settings_on_off(runtime_feedback_present(gyro)));
  if(!runtime_feedback_present(gyro))t=[t stringByAppendingString:settings_text("（下次启动生效）"," (from the next launch)")];
  return settings_row(t,nil,nil,^int{return runtime_feedback_choice(gyro);},^(int v){runtime_feedback_choose(gyro,v);});
+}
+/* Gyro calibration (runtime/motion_fusion.c): the first line is the state (the countdown, the result, or the bias kept), the others
+   start it (5 s to lay the controller still, then 3 s of sampling) or drop it; the bias is saved in gyro-bias.txt. */
+static NSString *settings_gyro_cal_text(void) {
+ double left=0;int st=runtime_gyro_cal_state(&left);
+ if(st==GYRO_CAL_COUNTDOWN)return [NSString stringWithFormat:@(TOTK_UI("倒计时 %d 秒：请把手柄放平放稳","Lay it still: %d s")),(int)ceil(left)];
+ if(st==GYRO_CAL_SAMPLING)return settings_text("校准中，请勿触碰手柄…","Calibrating, do not touch…");
+ if(st==GYRO_CAL_DONE)return settings_text("校准完成，已保存","Calibrated and saved");
+ if(st==GYRO_CAL_MOVED)return settings_text("失败：手柄在动，请重试","Failed: it moved, try again");
+ if(st==GYRO_CAL_NO_DATA)return settings_text("失败：没有陀螺仪数据","Failed: no gyro data");
+ double b[3];runtime_gyro_bias_get(b);
+ if(!b[0]&&!b[1]&&!b[2])return settings_text("未校准","Not calibrated");
+ return [NSString stringWithFormat:@(TOTK_UI("已校准（偏置 %.2f°/秒）","Calibrated (bias %.2f°/s)")),sqrt(b[0]*b[0]+b[1]*b[1]+b[2]*b[2])*180/M_PI];
+}
+static TOTKSettingRow *settings_gyro_cal_row(void) {
+ TOTKSettingRow *r=settings_row(settings_text("陀螺仪校准","Gyro calibration"),
+  @[settings_gyro_cal_text(),settings_text("开始校准（先倒数 5 秒）","Start (5 s countdown)"),settings_text("清除校准","Clear calibration")],@[@0,@1,@2],
+  ^int{return 0;},^(int v){if(v==1)runtime_gyro_cal_start();else if(v==2)runtime_gyro_bias_clear();});
+ r.firstTitle=^NSString *{return settings_gyro_cal_text();};return r;
 }
 /* Rumble strength in thousandths: 0.5x to 4x, and the strength in force when rumble-gain.txt holds another one. */
 static int settings_gain_now(void) { return (int)fmax(1, lroundf(runtime_rumble_gain()*1000)); }
@@ -729,6 +749,11 @@ static TOTKSettingRow *settings_oot_profile_row(void) {
  return settings_row(settings_text("画质档位","Quality profile"),@[settings_text("底座","Docked"),settings_text("掌机（植被较少，更快，默认）","Handheld (less vegetation, faster, default)")],@[@0,@1],
   ^int{return !runtime_operation_mode_docked();},^(int v){runtime_operation_mode_choose(!v,1);settings_save_int("graphics-profile.txt",v,"quality profile");});
 }
+extern void runtime_qo_async_set(int on); extern int runtime_qo_async_flag(void);
+static TOTKSettingRow *settings_oot_async_replay_row(void) {
+ return settings_row(settings_text("队列回放线程","Queue replay thread"),@[settings_text("主线程（同步）","Main thread (synchronous)"),settings_text("队列线程（异步，更快，默认）","Queue thread (async, faster, default)")],@[@0,@1],
+  ^int{return runtime_qo_async_flag();},^(int v){runtime_qo_async_set(v);settings_save_int("graphics-async-replay.txt",v,"async queue replay");});
+}
 #endif
 #if defined(GAME_OOT) && !TARGET_OS_IPHONE
 /* The resolution row: the canvas and the 3D picture together, in force at once. */
@@ -892,7 +917,7 @@ static NSArray<TOTKSettingRow *> *settings_rows(void) {
  [rows addObject:settings_ns2_resolution_row()];
 #elif defined(GAME_OOT) && !TARGET_OS_IPHONE
  (void)resolution;   /* every resolution setting of this game is on this page (user 2026-11-09) */
- [rows addObject:settings_oot_output_row()];[rows addObject:settings_oot_upscaler_row()];[rows addObject:settings_oot_net_copy_row()];[rows addObject:settings_oot_profile_row()];
+ [rows addObject:settings_oot_output_row()];[rows addObject:settings_oot_upscaler_row()];[rows addObject:settings_oot_net_copy_row()];[rows addObject:settings_oot_profile_row()];[rows addObject:settings_oot_async_replay_row()];
 #else
  if(res.count<2)[rows addObject:settings_fixed(resolution,@"1080p")];
  else [rows addObject:settings_row(resolution,res,resModes,
@@ -938,6 +963,7 @@ static NSArray<TOTKSettingRow *> *settings_rows(void) {
  [rows addObject:settings_feedback_row(0)];
  [rows addObject:settings_gain_row()];
  [rows addObject:settings_feedback_row(1)];
+ [rows addObject:settings_gyro_cal_row()];
  NSUInteger input=rows.count;
  /* User (runtime/users.h, docs/users.md): the user this run opened with, and the one the next launch gets — the save
     area is named after the user's id, so another user plays on their own saves. A running game keeps its user. */

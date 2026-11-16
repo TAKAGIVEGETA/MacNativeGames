@@ -448,7 +448,9 @@ def package_app(work,tree,out,game_data_mode='app',game_data_folder=None,shared=
     # builds it from its pinned source), so the App carries no dylib for it, only its license.
     clone_file(GAME/'third_party/dav1d-COPYING',res/'licenses/dav1d-COPYING')
     info=dict(CFBundleDevelopmentRegion='en',CFBundleExecutable='OcarinaOfTime',CFBundleIdentifier='org.macnativegames.oot',CFBundleName='Ocarina of Time',CFBundleDisplayName='Ocarina of Time',CFBundlePackageType='APPL',CFBundleShortVersionString='131072',CFBundleVersion='131072',LSMinimumSystemVersion='26.0',NSHighResolutionCapable=True,LSSupportsGameMode=True,GCSupportsControllerUserInteraction=True)
+    custom_icon=GAME/'assets/AppIcon.icns'
     icon=tree/'build/AppIcon.icns'   # the game's icon (assets/app-icon.json, made by build), as build_app.py puts it in the app
+    if custom_icon.is_file():icon.write_bytes(custom_icon.read_bytes())
     if icon.is_file():clone_file(icon,res/'AppIcon.icns');info['CFBundleIconFile']='AppIcon'
     if game_data_mode=='library':info['MNGGameDataFolder']=str(game_data_folder)
     info['MNGShaders']=mode   # shader_mode: 'title' is a quick build, filled in by MNG Launcher's 补全着色器 (update_shaders)
@@ -711,8 +713,10 @@ def build(args, source):
     shutil.copy2(proof.with_name('SPIRV-Tools.LICENSE'),service/'SPIRV-Tools.LICENSE')
     (tree/'build/shader-map.tsv').write_text('# TOTK control-code-sha256-v1\n')
     run(['make','-C',GAME,'WORK='+str(make_path(work)),'-j2'],'native-runtime',work)
+    custom_icon=GAME/'assets/AppIcon.icns'
     icon_spec=GAME/'assets/app-icon.json'   # the dump has no Control data: the pinned official image, as Donkey Kong Bananza
-    if icon_spec.is_file():run([py,'scripts/extract_app_icon.py','--source-spec',icon_spec,'--output','build/AppIcon.icns'],'app-icon')
+    if custom_icon.is_file():(tree/'build/AppIcon.icns').write_bytes(custom_icon.read_bytes())
+    elif icon_spec.is_file():run([py,'scripts/extract_app_icon.py','--source-spec',icon_spec,'--output','build/AppIcon.icns'],'app-icon')
     mode='full' if device else shader_mode()
     if mode=='none':print('Shaders are not bundled (OOT_BUNDLE_SHADERS=0): translated at first use',flush=True)
     else:
