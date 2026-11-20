@@ -144,7 +144,7 @@ void runtime_aspect_view(double w, double h);   /* frontend.m: the window's draw
 float runtime_aspect_now(void);     /* the ratio in force, 0 = the game's own 16:9 */
 void runtime_front_resize_aspect(double ratio);   /* Mac: resize the window to a selected picture ratio */
 int hud_compact(void);   /* gfx/nvn/fps_overlay.c: the overlay lines go to the window's corner panel (TOTK_HUD=corners: in the picture) */
-int hud_snapshot(int line, char *out, size_t n, int *highlight);   /* line 0..3: FPS, shaders, render pipelines, load; 0 = not published */
+int hud_snapshot(int line, char *out, size_t n, int *highlight);   /* line: fps_overlay.h HUD_* (drawn in HUD_ORDER); 0 = not published */
 
 void *runtime_account_override(const char *name);
 
@@ -229,6 +229,22 @@ void runtime_mouse_release(void);                   /* main thread: buttons up, 
 void runtime_capture_set_hook(void (*hook)(void));
 void runtime_capture_press(void) __attribute__((weak));   /* gamepad.m (weak: probes that link input.c alone): the capture button pressed once (the input file's "capture") */
 void runtime_gamepad_switch_capture(void *controller, int pressed);   /* Switch 0x30 report: 1 while the button is down (any queue) */
+int runtime_dsu_motion_active(void);     /* fresh DSU six-axis samples currently own motion, not just an open socket */
+typedef struct {
+    int enabled, slot, locked;
+    char endpoint[264];
+} RuntimeDSUSettings;
+typedef struct {
+    int connected, sensor;
+    double acc[3], gyro[3];   /* gyro in degrees/second for the settings display */
+    uint32_t buttons;
+    uint8_t axes[4];
+    char error[160];
+} RuntimeDSUStatus;
+void runtime_dsu_settings(RuntimeDSUSettings *out);   /* main queue; environment overrides saved preferences */
+void runtime_dsu_status(RuntimeDSUStatus *out);       /* main queue; passive snapshot */
+int runtime_dsu_apply(const RuntimeDSUSettings *settings); /* 0 applied and saved, -1 invalid, -2 environment locked */
+void runtime_feedback_motion_source_changed(void);   /* switch between DSU and native motion without changing rumble */
 void runtime_touch_pad_set(const RuntimeGamepadState *state);   /* on-screen touch controls (iOS) */
 int runtime_phone_fps(void);                /* d2r_gfx hle_nvn.c, iPhone / iPad: 30 while held at 30 (TOTK_PHONE_FPS), else 60 */
 void runtime_phone_fps_set(int fps);        /* 30 holds 30, anything else up to 60: the touch controls' button, at once */
@@ -271,6 +287,8 @@ void runtime_motion_phone(int on);  /* the iPhone's own sensor feeds the six-axi
 void runtime_motion_mouse(int on);  /* mouse mode (key 7) takes the sensor over (1) / gives it back to the controller (0) */
 void runtime_motion_feed_mouse(const double acc_g[3], const double gyro_rad_s[3], uint64_t now_ns);   /* already in the reference frame */
 /* Gyro calibration (settings panel; runtime/motion_fusion.c): a countdown, then the mean of the resting rate is the bias taken off every sample. */
+#ifndef RUNTIME_HAS_GYRO_CAL_DECL
+#define RUNTIME_HAS_GYRO_CAL_DECL 1
 enum { GYRO_CAL_IDLE, GYRO_CAL_COUNTDOWN, GYRO_CAL_SAMPLING, GYRO_CAL_DONE, GYRO_CAL_MOVED, GYRO_CAL_NO_DATA };
 void runtime_gyro_cal_start(void);
 void runtime_gyro_cal_cancel(void);
@@ -279,6 +297,7 @@ void runtime_gyro_bias_get(double bias_rad_s[3]);
 void runtime_gyro_bias_set(const double bias_rad_s[3]);
 void runtime_gyro_bias_clear(void);   /* no bias (saved as such) */
 void runtime_gyro_bias_hook(void (*save)(const double bias_rad_s[3]));   /* called when a calibration or a clear changed the bias */
+#endif
 void runtime_feedback_quiet(void);   /* focus lost: stop rumbling */
 #ifdef __OBJC__
 @class GCController;
