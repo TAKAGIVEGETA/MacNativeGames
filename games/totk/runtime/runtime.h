@@ -114,10 +114,9 @@ int runtime_render_res(unsigned *w, unsigned *h);   /* TOTK_RENDER_RES above 160
    canvas and scene (game_patches_v143.c runtime_output_res).
    runtime_output_modes: a bit (1 << mode) for each this game and start offer; 0 when the resolution cannot change. */
 /* OUTPUT_MODE_NATIVE_4K_METALFX (4K + MetalFX to the headset) and OUTPUT_MODE_NATIVE_6K: VR only (zeldaVR,
-   game_patches_v143.c vr_big_mode); after NATIVE_5K, whose number players' graphics-output.txt keeps. OUTPUT_MODE_720P_METALFX
-   is last for the same reason. */
-enum { OUTPUT_MODE_OFF, OUTPUT_MODE_METALFX, OUTPUT_MODE_NATIVE, OUTPUT_MODE_NATIVE_METALFX, OUTPUT_MODE_720P, OUTPUT_MODE_NATIVE_4K, OUTPUT_MODE_NATIVE_5K, OUTPUT_MODE_NATIVE_4K_METALFX, OUTPUT_MODE_NATIVE_6K, OUTPUT_MODE_720P_METALFX };
-enum { OUTPUT_MODE_LAST = OUTPUT_MODE_720P_METALFX };
+   game_patches_v143.c vr_big_mode). Append new modes so old graphics-output.txt values keep their meaning. */
+enum { OUTPUT_MODE_OFF, OUTPUT_MODE_METALFX, OUTPUT_MODE_NATIVE, OUTPUT_MODE_NATIVE_METALFX, OUTPUT_MODE_720P, OUTPUT_MODE_NATIVE_4K, OUTPUT_MODE_NATIVE_5K, OUTPUT_MODE_NATIVE_4K_METALFX, OUTPUT_MODE_NATIVE_6K, OUTPUT_MODE_720P_METALFX, OUTPUT_MODE_4K_TO_5K_METALFX };
+enum { OUTPUT_MODE_LAST = OUTPUT_MODE_4K_TO_5K_METALFX };
 int runtime_output_modes(void);
 int runtime_output_mode(void);
 int runtime_output_mode_set(int mode);                  /* returns 0 where that mode is not offered */
@@ -148,7 +147,7 @@ void reshade_mode_set(int mode);
 int reshade_enabled(void);
 void reshade_set(int on);
 int hud_compact(void);   /* gfx/nvn/fps_overlay.c: the overlay lines go to the window's corner panel (TOTK_HUD=corners: in the picture) */
-int hud_snapshot(int line, char *out, size_t n, int *highlight);   /* line 0..3: FPS, shaders, render pipelines, load; 0 = not published */
+int hud_snapshot(int line, char *out, size_t n, int *highlight);   /* line: fps_overlay.h HUD_* (drawn in HUD_ORDER); 0 = not published */
 
 void *runtime_account_override(const char *name);
 
@@ -270,10 +269,28 @@ void runtime_motion_feed(const double acc_g[3], const double gyro_rad_s[3], uint
 int runtime_motion_axes(const char *spec);   /* TOTK_GYRO_AXES ("-x,y,-z"): 1 set, 0 unset, -1 malformed */
 void runtime_motion_deadzone_default(double deg_s);   /* when TOTK_GYRO_DEADZONE is unset: 1.2 for HID motion, else 0 */
 void runtime_motion_live(int on);   /* a controller with motion attached (1) / detached (0) */
+int runtime_dsu_motion_active(void);     /* fresh DSU six-axis samples currently own motion, not just an open socket */
+typedef struct {
+    int enabled, slot, locked;
+    char endpoint[264];
+} RuntimeDSUSettings;
+typedef struct {
+    int connected, sensor;
+    double acc[3], gyro[3];   /* gyro in degrees/second for the settings display */
+    uint32_t buttons;
+    uint8_t axes[4];
+    char error[160];
+} RuntimeDSUStatus;
+void runtime_dsu_settings(RuntimeDSUSettings *out);   /* main queue; environment overrides saved preferences */
+void runtime_dsu_status(RuntimeDSUStatus *out);       /* main queue; passive snapshot */
+int runtime_dsu_apply(const RuntimeDSUSettings *settings); /* 0 applied and saved, -1 invalid, -2 environment locked */
+void runtime_feedback_motion_source_changed(void);   /* switch between DSU and native motion without changing rumble */
 void runtime_motion_phone(int on);  /* the iPhone's own sensor feeds the six-axis device (1) / stops (0) */
 void runtime_motion_mouse(int on);  /* mouse mode (key 7) takes the sensor over (1) / gives it back to the controller (0) */
 void runtime_motion_feed_mouse(const double acc_g[3], const double gyro_rad_s[3], uint64_t now_ns);   /* already in the reference frame */
 /* Gyro calibration (settings panel; runtime/motion_fusion.c): a countdown, then the mean of the resting rate is the bias taken off every sample. */
+#ifndef RUNTIME_HAS_GYRO_CAL_DECL
+#define RUNTIME_HAS_GYRO_CAL_DECL 1
 enum { GYRO_CAL_IDLE, GYRO_CAL_COUNTDOWN, GYRO_CAL_SAMPLING, GYRO_CAL_DONE, GYRO_CAL_MOVED, GYRO_CAL_NO_DATA };
 void runtime_gyro_cal_start(void);
 void runtime_gyro_cal_cancel(void);
@@ -282,6 +299,7 @@ void runtime_gyro_bias_get(double bias_rad_s[3]);
 void runtime_gyro_bias_set(const double bias_rad_s[3]);
 void runtime_gyro_bias_clear(void);   /* no bias (saved as such) */
 void runtime_gyro_bias_hook(void (*save)(const double bias_rad_s[3]));   /* called when a calibration or a clear changed the bias */
+#endif
 void runtime_feedback_quiet(void);   /* focus lost: stop rumbling */
 #ifdef __OBJC__
 @class GCController;

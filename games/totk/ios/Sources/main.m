@@ -10,12 +10,15 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <math.h>
+#include <sys/sysctl.h>
 #include "runtime.h"
 #include "game_version.h"   // GAME_FOLDER and TOTK_GAME_VERSION of this build (build_ipa.py's -D flags)
 #include "dmsh_chain.h"
 #include "settings_map.h"
+#include "picture_settings.h"
 #include "ns2_resolution.h"
 #include "totk_shader_contrib.h"   // totk_contrib_prune
+#import "mng_active.h"            // the day's report of active players
 #include "totk_contrib_upload.h"   // the shader inbox: asked once, sent while playing
 #import "touch_pad.h"
 #import "start_screen.h"
@@ -28,6 +31,100 @@ static char *host_argv[3];
 static BOOL outputResolutionFromEnvironment;
 static NSString *g_no_game_data;   // set when there is no RomFS image to play from (didFinishLaunching)
 static NSString *g_seed_pack, *g_seed_unpack_to;   // a pushed shader pack to unpack before the game starts (seed_unpack)
+static NSString *g_seed_dir;       // the startup shaders' folder (game_data_ready): the app's own, or the one pushed
+static BOOL g_wait_for_data;       // the game data or the shaders are being copied (or not there yet): checked every second
+static uint64_t g_copy_done, g_copy_total;   // what of them is on the device so far (bytes), for the boot screen's bar
+static NSString *g_contrib;        // this game's shader contribution file (didFinishLaunching), pruned again once ready
+
+/* Bytes of the files in `folder` whose names start with one of `prefixes` and that changed since `since` (nil: any). */
+static uint64_t folder_bytes(NSString *folder, NSArray<NSString *> *prefixes, NSDate *since) {
+    NSFileManager *fm = NSFileManager.defaultManager; uint64_t sum = 0;
+    for (NSString *name in [fm contentsOfDirectoryAtPath:folder error:nil] ?: @[]) {
+        BOOL match = NO; for (NSString *p in prefixes) if ([name hasPrefix:p] || [name containsString:p]) { match = YES; break; }
+        if (!match) continue;
+        NSDictionary *a = [fm attributesOfItemAtPath:[folder stringByAppendingPathComponent:name] error:nil];
+        if (since && [a.fileModificationDate compare:since] == NSOrderedAscending) continue;
+        sum += a.fileSize;
+    }
+    return sum;
+}
+
+/* The game data and the startup shaders, in the app or in Documents/GameData (install_device.py --game-data and the
+   seed push put them there, writing their markers last): applied to the environment when both are there, and nil
+   returned; else what the boot screen says. While install_device.py is copying them (its markers say so) or before it
+   has begun, g_wait_for_data is set and g_copy_done / g_copy_total say how far the copy is: the boot screen asks again
+   every second and starts the game as soon as both are there (user 2026-11-19: "必须 能自己刷新 而且 传输的时候 有进度";
+   until then the screen said "still being copied" and stayed so, the game had to be closed and opened again). */
+static NSString *game_data_ready(NSString *docs, NSString *res) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    BOOL zh = [NSLocale.preferredLanguages.firstObject hasPrefix:@"zh"];
+    NSString *app = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleDisplayName"] ?: @"TOTK";   // the Files app's folder name
+    NSString *gameData = [docs stringByAppendingPathComponent:@"GameData"];
+    g_wait_for_data = NO; g_copy_done = g_copy_total = 0;
+    /* The 17 GB image may live in Documents/GameData instead of the app (romfs.bin or romfs.bin.000, ...; ios/tools/
+       install_device.py --game-data puts it there): a new build then installs without it, and reinstalling keeps it.
+       Excluded from iCloud backups. The runtime still hashes it once against the build's pin (TOTK_ROMFS_PROOF_DIR). */
+    BOOL image = [fm fileExistsAtPath:[gameData stringByAppendingPathComponent:@"romfs.bin"]] ||
+                 [fm fileExistsAtPath:[gameData stringByAppendingPathComponent:@"romfs.bin.000"]];
+    NSString *mark = [[NSString stringWithContentsOfFile:[gameData stringByAppendingPathComponent:@"romfs.sha256"] encoding:NSUTF8StringEncoding error:nil]
+                      stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    BOOL copying = mark && mark.length != 64;   // install_device.py writes "copying <sha256> <bytes>", the hash alone last
+    BOOL inApp = [fm fileExistsAtPath:[res stringByAppendingPathComponent:@"romfs/romfs.bin"]];
+    if (image && !copying) {
+        [[NSURL fileURLWithPath:gameData isDirectory:YES] setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:nil];
+        setenv("TOTK_ROMFS_DATA",gameData.fileSystemRepresentation,1);
+    } else if (!inApp) {
+        /* No image to play from yet: said on the screen instead of the game ending at once (runtime_fail exits), and
+           waited for: the copy's progress from its parts' sizes against the size the marker names. */
+        g_wait_for_data = YES;
+        NSArray<NSString *> *words = [mark componentsSeparatedByString:@" "];
+        g_copy_total = words.count >= 3 ? strtoull(words[2].UTF8String, NULL, 10) : 0;
+        g_copy_done = folder_bytes(gameData, @[@"romfs.bin."], nil);
+        return copying || image
+            ? [NSString stringWithFormat:(zh ? @"游戏数据正在复制到“文件 › 我的 iPhone › %@ › GameData”，复制完会自动开始。"
+                                             : @"The game data is being copied to Files › On My iPhone › %@ › GameData. The game starts when it is done."), app]
+            : [NSString stringWithFormat:(zh ? @"没有游戏数据。请在 Mac 上用 ios/tools/install_device.py --game-data 把它复制到“文件 › 我的 iPhone › %@ › GameData”，复制完会自动开始。"
+                                             : @"No game data. On the Mac, copy it to Files › On My iPhone › %@ › GameData with ios/tools/install_device.py --game-data; the game starts when it is there."), app];
+    }
+    /* The startup shaders likewise (build_app.py --ios-game-data documents): install_device.py puts the seed into its own
+       folder in Documents/GameData once per content and writes shader-seed.txt last ("<folder>\n<fingerprint>"; while
+       copying "stale <bytes>"), so the app carries none and a new build installs in seconds. Read in place like the app's
+       own (totk_shader_seed.h); folders of earlier seeds are removed in the background. */
+    NSString *seedDir = [res stringByAppendingPathComponent:@"shader-seed"];
+    NSString *seedTxt = [gameData stringByAppendingPathComponent:@"shader-seed.txt"];
+    NSArray<NSString *> *seedMark = [[NSString stringWithContentsOfFile:seedTxt encoding:NSUTF8StringEncoding error:nil] componentsSeparatedByString:@"\n"];
+    NSString *pushedName = seedMark.count >= 2 && seedMark[1].length == 64 && [seedMark[0] hasPrefix:@"shader-seed-"] && ![seedMark[0] containsString:@"/"] ? seedMark[0] : nil;
+    NSString *pushed = pushedName ? [gameData stringByAppendingPathComponent:pushedName] : nil;
+    BOOL packed = pushed && ![fm fileExistsAtPath:[pushed stringByAppendingPathComponent:@"seed-manifest.json"]] &&
+                  [fm fileExistsAtPath:[pushed stringByAppendingString:@".pack.000"]];
+    if (pushed && (packed || [fm fileExistsAtPath:[pushed stringByAppendingPathComponent:@"seed-manifest.json"]])) {
+        if (packed) { g_seed_pack = [pushed stringByAppendingString:@".pack"]; g_seed_unpack_to = pushed; }   // unpacked in viewDidAppear
+        seedDir = pushed; setenv("TOTK_SHADER_SEED_PUSHED", pushed.fileSystemRepresentation, 1);
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
+            NSFileManager *files = [NSFileManager new];
+            for (NSString *name in [files contentsOfDirectoryAtPath:gameData error:nil] ?: @[])
+                if ([name hasPrefix:@"shader-seed-"] && ![name hasPrefix:pushedName]) [files removeItemAtPath:[gameData stringByAppendingPathComponent:name] error:nil];
+        });
+    } else if (![fm fileExistsAtPath:[seedDir stringByAppendingPathComponent:@"seed-manifest.json"]]) {
+        /* The shaders are being copied (after the game data) or not there yet: waited for, with the parts written since
+           the marker said so against the size it names. */
+        g_wait_for_data = YES;
+        NSArray<NSString *> *words = [seedMark.firstObject componentsSeparatedByString:@" "];
+        BOOL copyingSeed = [words.firstObject isEqualToString:@"stale"];
+        g_copy_total = copyingSeed && words.count >= 2 ? strtoull(words[1].UTF8String, NULL, 10) : 0;
+        g_copy_done = copyingSeed ? folder_bytes(gameData, @[@".img.", @".pack."],
+                                                 [fm attributesOfItemAtPath:seedTxt error:nil].fileModificationDate) : 0;
+        return copyingSeed
+            ? (zh ? @"着色器正在复制到手机，复制完会自动开始。" : @"The shaders are being copied to the device. The game starts when they are there.")
+            : (zh ? @"没有着色器。请在 Mac 上用 ios/tools/install_device.py 重新安装（会把着色器复制到手机上），复制完会自动开始。"
+                  : @"No shaders. Install the game again from the Mac with ios/tools/install_device.py (it copies them to the device); the game starts when they are there.");
+    }
+    g_seed_dir = seedDir;
+    setenv("TOTK_SHADER_SEED_DIR",seedDir.fileSystemRepresentation,1);
+    setenv("DM_NVN_SHMAP",[seedDir stringByAppendingPathComponent:@"shader_map.tsv"].fileSystemRepresentation,1);
+    setenv("DM_MSL_DIR",seedDir.fileSystemRepresentation,1);
+    return nil;
+}
 
 /* The startup shaders arrive as one stream cut into 1 GiB parts (<folder>.pack.000, .001, ...; ios/tools/install_device.py
    push_seed): devicectl stops after ~25,000 of the seed's 128,000 files when it copies a folder (2026-10-23). Stream:
@@ -145,6 +242,28 @@ static void apply_display_settings(void);   // below, next to the pane helpers i
     runtime_ios_attach_layer((CAMetalLayer *)self.gameView.layer, self.gameView);
     TOTKTouchPad *pad=[[TOTKTouchPad alloc] initWithFrame:self.view.bounds];pad.autoresizingMask=UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;[self.view addSubview:pad];
 }
+/* "Switch screen size" (TOTK_SWITCH_SIZE=1; settings_map.c totk_switch_size; user 2026-11-17): once the game
+   starts, the game view is the Switch's 6.2-inch 16:9 screen, centred on the black view, so a low-resolution picture is
+   shown smaller and looks sharper; the touch controls keep the whole screen. iPad only: an iPhone's screen is smaller
+   than the Switch's. Off, or where that picture would not be smaller, the view fills the screen as before. */
+#if !TARGET_OS_VISION   // no UIScreen there, and the headset's window is no Switch-sized picture
+static BOOL g_switch_size;
+- (void)placeGameView {
+    CGRect b = self.view.bounds; double w = 0, h = 0;
+    char machine[32] = ""; size_t n = sizeof machine;
+    UIScreen *screen = self.view.window.windowScene.screen;
+    CGFloat scale = screen.nativeScale > 0 ? screen.nativeScale : self.view.traitCollection.displayScale;   // pixels per point
+    if (g_switch_size && UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad && !sysctlbyname("hw.machine", machine, &n, NULL, 0) &&
+        totk_switch_size(b.size.width, b.size.height, totk_ipad_ppi(machine), scale, &w, &h)) {
+        self.gameView.autoresizingMask = UIViewAutoresizingNone;
+        self.gameView.frame = CGRectMake(round((b.size.width - w) / 2), round((b.size.height - h) / 2), round(w), round(h));
+    } else {
+        self.gameView.autoresizingMask = UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
+        self.gameView.frame = b;
+    }
+}
+- (void)viewDidLayoutSubviews { [super viewDidLayoutSubviews]; if (g_switch_size) [self placeGameView]; }   // a resized window
+#endif
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
     static BOOL started; if (started) return; started = YES;
@@ -153,8 +272,42 @@ static void apply_display_settings(void);   // below, next to the pane helpers i
     BOOL zh = [NSLocale.preferredLanguages.firstObject hasPrefix:@"zh"];   // the same rule as the boot screen (totk_ui_lang.h)
     if (g_no_game_data) {
         runtime_boot_status(zh ? "无法开始游戏" : "Cannot start the game", g_no_game_data.UTF8String);
+        if (g_wait_for_data) [self waitForGameData];
         return;
     }
+    [self startAfterChecks];
+}
+/* The game data or the shaders are being copied from the Mac (or not there yet): asked again every second, the copy's
+   progress on the boot screen (its bar and "x / y GB"), and the game started as soon as both are there (user 2026-11-19:
+   "必须 能自己刷新 而且 传输的时候 有进度"). */
+- (void)waitForGameData {
+    BOOL zh = [NSLocale.preferredLanguages.firstObject hasPrefix:@"zh"];
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
+    NSString *res = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"GameData"];
+    __weak TOTKGameController *weakSelf = self;
+    [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *timer) {
+        NSString *missing = game_data_ready(docs, res);
+        if (missing) {
+            if (g_copy_total) {
+                static char stage[512];
+                snprintf(stage, sizeof stage, "%s", missing.UTF8String);
+                runtime_boot_progress(stage, MIN(g_copy_done, g_copy_total), g_copy_total);
+            } else {
+                runtime_boot_status(zh ? "等待游戏数据" : "Waiting for the game data", missing.UTF8String);
+            }
+            return;
+        }
+        [timer invalidate];
+        g_no_game_data = nil;
+        fprintf(stderr, "[totk] the game data and the shaders are there: starting\n");
+        if (g_contrib) totk_contrib_prune(g_contrib, g_seed_dir, g_seed_dir);
+        runtime_boot_status(zh ? "正在启动" : "Starting", NULL);
+        [weakSelf startAfterChecks];
+    }];
+}
+/* What follows the game data's check before the game starts: the save folder question, the shader question, then the
+   start itself (prepareAndStart). */
+- (void)startAfterChecks {
     cloud_folder_forget_if_asked();
     if (g_pick_cloud_folder || [NSUserDefaults.standardUserDefaults boolForKey:@"TOTK_CLOUD_SAVE_PICK"]) {
         __weak TOTKGameController *weakSelf = self;
@@ -260,6 +413,11 @@ static void contrib_settings_sync(NSString *contrib) {
     __weak TOTKGameController *weak = self;
     void (^start)(void) = ^{
         apply_display_settings();
+        // The 60/30 button was drawn before Play; it shows the frame rate the picture holds now.
+        for (UIView *v in weak.view.subviews) if ([v isKindOfClass:TOTKTouchPad.class]) [v setNeedsDisplay];
+        const char *switch_size = getenv("TOTK_SWITCH_SIZE");   // the picture settings hand it over (apply_display_settings)
+        g_switch_size = switch_size && !strcmp(switch_size, "1");
+        [weak placeGameView];   // the Switch's screen size, when chosen, before the drawable takes the view's shape
         runtime_ios_sync_drawable(weak.gameView);   // the drawable follows the chosen picture (TOTK_IOS_DRAWABLE_H)
         [weak boot];
     };
@@ -367,7 +525,7 @@ static void audio_observe(void) {
     }];
 }
 
-#if !TARGET_OS_VISION
+#if !TARGET_OS_VISION && defined(GAME_NS2)
 /* apply_settings runs before the window scene exists, so there is no scene screen to ask yet. */
 static NSDictionary *pref_row(NSDictionary *root, NSString *key) {
     for (NSDictionary *item in root[@"PreferenceSpecifiers"] ?: @[])
@@ -375,9 +533,8 @@ static NSDictionary *pref_row(NSDictionary *root, NSString *key) {
     return nil;
 }
 #endif
-/* Both layers hand their operation mode and frame pacing over through these two, so the overwrite policy exists once.
-   Breath of the Wild has the same switch; its docked scene is the pane's TOTK_BOTW_SCENE (the Switch's 1600x900 or HD
-   1920x1080, game_patches_botw.c patch_render_phone). */
+#ifdef GAME_NS2
+/* Bananza's and Pokopia's presets hand their operation mode and frame pacing over through these two. */
 static void apply_operation_mode(const char *mode) {
     setenv("TOTK_OPERATION_MODE", mode, 1);
 }
@@ -388,15 +545,18 @@ static void apply_frame_env(const totk_frame_env *e, int overwrite) {
     if (e->phone_fps) setenv("TOTK_PHONE_FPS", e->phone_fps, overwrite);
     else if (overwrite) unsetenv("TOTK_PHONE_FPS");
 }
+#endif
 
 #if !TARGET_OS_VISION
-/* The presets' picture and frame rate, from the rows the Settings app and the start screen (start_screen.m) write;
-   applied once, just before the game thread starts, so the start screen's pick counts (after PR #433: applying them in
-   didFinishLaunching as well left a 1080 drawable behind when the start screen then turned Full HD off). The picture keys
-   keep a devicectl value (overwrite=0), as before the pane had layers. The custom layer was handed over in apply_settings
-   and the start screen does not write its rows, so it is left as it is. The mapping is settings_map.c's. */
+/* The picture and frame rate, applied once, just before the game thread starts, so the start screen's pick counts (after
+   PR #433: applying them in didFinishLaunching as well left a 1080 drawable behind when the start screen then turned
+   Full HD off). Tears of the Kingdom and Breath of the Wild: the picture profile, MetalFX and the custom combination
+   (picture_settings.m, picture_profile.c; user 2026-11-17). Bananza and Pokopia: their presets
+   (settings_map.c). Every key keeps a devicectl value (overwrite=0). */
 static void apply_display_settings(void) {
+#ifdef GAME_NS2
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+#endif
 #ifdef GAME_DKB
     if (!outputResolutionFromEnvironment) {
         NSString *size=[d stringForKey:@"TOTK_OUTPUT_RES"] ?: @"960x540";
@@ -410,7 +570,16 @@ static void apply_display_settings(void) {
         char height[16];snprintf(height,sizeof height,"%u",h);setenv("TOTK_IOS_DRAWABLE_H",height,0);
     }
 #endif
-    if ([d boolForKey:@"TOTK_CUSTOM_PICTURE"]) return;
+#ifndef GAME_NS2
+    pp_profile profile; pp_metalfx mfx;
+    pp_picture pic = totk_current_picture(&profile, &mfx);
+    pp_env env;
+    pp_env_build(&pic, mfx, PP_THIS_GAME, &env);   /* Breath of the Wild, Tears of the Kingdom 1.4.3, or 1.0 / 1.2.1 */
+    for (int i = 0; i < env.n; i++) if (env.v[i].value) setenv(env.v[i].name, env.v[i].value, 0);
+    fprintf(stderr, "[totk] picture: profile %s, metalfx %s; %s, scene %s, taa %s, %s fps, Switch size %s, drawable %s\n",
+            pp_profile_key(profile), pp_metalfx_key(mfx), getenv("TOTK_OPERATION_MODE") ?: "?", getenv("TOTK_RENDER_RES") ?: "?",
+            getenv("TOTK_TAA") ?: "?", pic.fps == 30 ? "30" : "60", getenv("TOTK_SWITCH_SIZE") ?: "?", getenv("TOTK_IOS_DRAWABLE_H") ?: "default");
+#else
     totk_preset_env prenv;
     totk_preset_env_build([d boolForKey:@"TOTK_DOCKED"], &prenv);
     if (prenv.drawable) setenv("TOTK_IOS_DRAWABLE_H", prenv.drawable, 0);
@@ -426,15 +595,21 @@ static void apply_display_settings(void) {
     NSString *fps = [d stringForKey:@"TOTK_PHONE_FPS"] ?: @"60";
     totk_frame_env fe;
     if (totk_preset_frame_env_build(fps.UTF8String, &fe)) apply_frame_env(&fe, 1);
+#endif
+    /* The touch controls drew their 60 / 30 button before Play, and the runtime kept the hold it read then (hle_nvn.c
+       phone_holds_30 reads TOTK_PHONE_FPS once): every game takes the hold from the environment just handed over (iPad
+       A16 2026-11-18: Economy ran at 60; Bananza's and Pokopia's start-screen frame rate was lost the same way; after
+       PR #2287). */
+    const char *phone_fps = getenv("TOTK_PHONE_FPS");
+    runtime_phone_fps_set(phone_fps && atoi(phone_fps) == 30 ? 30 : 60);
 }
 #endif
 
 /* The Settings app pane is the single source of defaults: every TOTK_* row with a DefaultValue is registered, so the
    game sees the same defaults before the player changes anything, then handed to the runtime as an environment
-   variable (overwrite=0, so devicectl can still supply a plain key). The picture and frame keys belong to one of the
-   pane's two layers, chosen by TOTK_CUSTOM_PICTURE: the presets (Full HD, frame rate) when it is off, the custom
-   picture and frame rows when it is on. Only the chosen layer is handed over, so no key is written twice. visionOS is
-   the exception: its platform defaults own the picture and frame keys (the pane's rows describe a phone display). */
+   variable (overwrite=0, so devicectl can still supply a plain key). The picture itself goes when the game starts
+   (apply_display_settings). visionOS is the exception: its platform defaults own the picture and frame keys (the
+   pane's rows describe a phone display). */
 static void apply_settings(void) {
     NSBundle *settings = [NSBundle bundleWithPath:[NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"Settings.bundle"]];
     NSString *path = [settings pathForResource:@"Root" ofType:@"plist"];
@@ -467,13 +642,11 @@ static void apply_settings(void) {
        changed is stored once: the pane then shows what the game uses. */
     NSDictionary *stored = [d persistentDomainForName:NSBundle.mainBundle.bundleIdentifier] ?: @{};
     for (NSString *key in pad) if (!stored[key]) [d setObject:pad[key] forKey:key];
-    /* One switch between the pane's layers (Root.plist, "Use custom settings"): the layer that is off is not handed
-       over at all, so neither can overwrite the other. Which keys belong to which layer is settings_map.c's table. */
-    BOOL custom = [d boolForKey:@"TOTK_CUSTOM_PICTURE"];
-    totk_key_layer layer_of = custom ? TOTK_KEY_CUSTOM : TOTK_KEY_PRESET;
+#if !TARGET_OS_VISION && !defined(GAME_NS2)
+    /* The picture rows of before the profiles become the custom profile, once (picture_settings.m). */
+    totk_migrate_picture_rows();
+#endif
     for (NSString *key in defaults) {
-        totk_key_layer owned = totk_key_layer_of(key.UTF8String);
-        if (owned != TOTK_KEY_ALWAYS && owned != layer_of) continue;
         id value = [d objectForKey:key];
         if ([value isKindOfClass:NSNumber.class]) {
             setenv(key.UTF8String, [value boolValue] ? "1" : "0", 0);
@@ -489,70 +662,30 @@ static void apply_settings(void) {
             }
             setenv(key.UTF8String, [value UTF8String], 0);
         }
-        /* overwrite=0: a devicectl value for a plain key still wins. The layer block below owns the picture and frame
-           keys of the chosen layer. */
+        /* overwrite=0: a devicectl value for a plain key still wins. */
     }
 #if !TARGET_OS_VISION
     NSString *layer;
-    if (custom) {
-        /* The picture mode owns the drawable, the output upscale and the operation mode (the 1080 entry runs the
-           game's docked settings). The scene upscale stays the pane's own switch, except for the MetalFX entry: its
-           output upscale only runs while that switch is on, so the entry turns it on itself. */
-        NSString *picture = [d stringForKey:@"TOTK_IOS_PICTURE_MODE"];
-        totk_picture_env penv;
-        if (!totk_picture_env_build(picture.UTF8String, &penv)) {
-            fprintf(stderr, "[totk] settings: picture mode \"%s\" is not a pane value; using %s\n",
-                    picture.UTF8String ?: "", totk_picture_mode_default());
-            picture = [NSString stringWithUTF8String:totk_picture_mode_default()];
-            totk_picture_env_build(picture.UTF8String, &penv);
-        }
-        setenv("TOTK_IOS_DRAWABLE_H", penv.drawable, 1);
-        setenv("TOTK_MFX_OUTPUT", penv.output_upscale, 1);
-        if (penv.scene_upscale) setenv("TOTK_MFX_UPSCALE", penv.scene_upscale, 1);
-        apply_operation_mode(penv.operation);
-        /* Frame rate is one choice: the cap. */
-        NSString *cap = [d stringForKey:@"TOTK_FPS_CAP"];
-        totk_frame_env fenv;
-        if (!totk_frame_env_build(cap.UTF8String, &fenv)) {
-            fprintf(stderr, "[totk] settings: frame cap \"%s\" is not a pane value; using %s\n",
-                    cap.UTF8String ?: "", totk_frame_cap_default());
-            cap = [NSString stringWithUTF8String:totk_frame_cap_default()];
-            [d setObject:cap forKey:@"TOTK_FPS_CAP"];
-            totk_frame_env_build(cap.UTF8String, &fenv);
-        }
-        apply_frame_env(&fenv, 1);
-        /* A stored scene the pane no longer offers would leave the game at a size it cannot name; use the pane's
-           default and say so. A value from devicectl is this launch's input rather than the player's stored choice,
-           so it is left alone (the runtime validates it itself). */
-        NSDictionary *scene_row = pref_row(root, @"TOTK_RENDER_RES");
-        NSArray *scene_values = scene_row[@"Values"] ?: @[];
-        NSString *fallback = scene_row[@"DefaultValue"] ?: @"960x540";
-        NSString *scene_text = [d stringForKey:@"TOTK_RENDER_RES"];
-        if (scene_values.count && (!scene_text || ![scene_values containsObject:scene_text])) {
-            fprintf(stderr, "[totk] settings: scene \"%s\" is not a pane value; using %s\n",
-                    scene_text.UTF8String ?: "", fallback.UTF8String);
-            [d setObject:fallback forKey:@"TOTK_RENDER_RES"];
-            if (!getenv("TOTK_RENDER_RES")) setenv("TOTK_RENDER_RES", fallback.UTF8String, 1);
-        }
-        layer = [NSString stringWithFormat:@"custom (%@, scene %s, %@ fps)", picture, getenv("TOTK_RENDER_RES") ?: "?", cap];
-    } else {
-        /* The presets: the Full HD switch owns the drawable and the scene, the frame row owns the pacing. Their picture
-           is handed over by apply_display_settings when the game starts, after the start screen; here only the frame row
-           goes (overwrite 0) and is checked, and apply_display_settings sets it again. */
-        /* The row's own default, so the pane stays the only place it is written (the literal only covers a pane that
-           lost the row). */
-        NSDictionary *fps_row = pref_row(root, @"TOTK_PHONE_FPS");
-        NSString *preset_fps = [d stringForKey:@"TOTK_PHONE_FPS"] ?: fps_row[@"DefaultValue"] ?: @"60";
-        totk_frame_env pfenv;
-        if (!totk_preset_frame_env_build(preset_fps.UTF8String, &pfenv)) {
-            fprintf(stderr, "[totk] settings: preset frame rate \"%s\" is not a pane value; using 60\n", preset_fps.UTF8String);
-            preset_fps = @"60";
-            totk_preset_frame_env_build(preset_fps.UTF8String, &pfenv);
-        }
-        apply_frame_env(&pfenv, 0);
-        layer = [NSString stringWithFormat:@"presets (%@, %@ fps)",
-                 [d boolForKey:@"TOTK_DOCKED"] ? @"Full HD docked" : @"handheld", preset_fps];
+#ifdef GAME_NS2
+    /* The presets: the Full HD switch owns the drawable and the scene, the frame row owns the pacing. Their picture
+       is handed over by apply_display_settings when the game starts, after the start screen; here only the frame row
+       goes (overwrite 0) and is checked, and apply_display_settings sets it again. */
+    /* The row's own default, so the pane stays the only place it is written (the literal only covers a pane that
+       lost the row). */
+    NSDictionary *fps_row = pref_row(root, @"TOTK_PHONE_FPS");
+    NSString *preset_fps = [d stringForKey:@"TOTK_PHONE_FPS"] ?: fps_row[@"DefaultValue"] ?: @"60";
+    totk_frame_env pfenv;
+    if (!totk_preset_frame_env_build(preset_fps.UTF8String, &pfenv)) {
+        fprintf(stderr, "[totk] settings: preset frame rate \"%s\" is not a pane value; using 60\n", preset_fps.UTF8String);
+        preset_fps = @"60";
+        totk_preset_frame_env_build(preset_fps.UTF8String, &pfenv);
     }
+    apply_frame_env(&pfenv, 0);
+    layer = [NSString stringWithFormat:@"presets (%@, %@ fps)",
+             [d boolForKey:@"TOTK_DOCKED"] ? @"Full HD docked" : @"handheld", preset_fps];
+#else
+    layer = @"picture profile (handed over at game start)";
+#endif
     /* The pane's rows are handed over as they are. Two overlays are their own switches (the runtime reads them
        independently, gfx/nvn/fps_overlay.c); they come through this loop with every other row, so a pane that is
        missing leaves the runtime's own default (on) in place. */
@@ -579,6 +712,11 @@ static void apply_settings(void) {
     // Controller input does not reset the idle timer; auto-lock would suspend the game mid-play or mid shader import.
     application.idleTimerDisabled = YES;
     audio_observe();
+#ifdef GAME_INBOX_ID   /* the day's report of active players (mng_active.h; off in the Settings app's pane) */
+    mng_active_start(@GAME_INBOX_ID, mng_active_version());
+#else
+    mng_active_start(@"totk", mng_active_version());
+#endif
     /* The Mac launcher passes the preferred language as TOTK_LOCALE (PR #97); "zh-Hans-CN" maps to zh-Hans in services.c. */
     NSString *preferred = NSLocale.preferredLanguages.firstObject;
     if (preferred.length) setenv("TOTK_LOCALE", preferred.UTF8String, 1);
@@ -601,49 +739,9 @@ static void apply_settings(void) {
     /* The 17 GB image may live in Documents/GameData instead of the app (romfs.bin or romfs.bin.000, ...; ios/tools/
        install_device.py --game-data puts it there): a new build then installs without it, and reinstalling keeps it.
        Excluded from iCloud backups. The runtime still hashes it once against the build's pin (TOTK_ROMFS_PROOF_DIR). */
-    NSString *gameData = [docs stringByAppendingPathComponent:@"GameData"];
-    BOOL image = [fm fileExistsAtPath:[gameData stringByAppendingPathComponent:@"romfs.bin"]] ||
-                 [fm fileExistsAtPath:[gameData stringByAppendingPathComponent:@"romfs.bin.000"]];
-    NSString *mark = [NSString stringWithContentsOfFile:[gameData stringByAppendingPathComponent:@"romfs.sha256"] encoding:NSUTF8StringEncoding error:nil];
-    BOOL copying = mark && [mark stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].length != 64;   // install_device.py writes the hash last
-    if (image && !copying) {
-        [[NSURL fileURLWithPath:gameData isDirectory:YES] setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:nil];
-        setenv("TOTK_ROMFS_DATA",gameData.fileSystemRepresentation,1);
-    } else if (![fm fileExistsAtPath:[res stringByAppendingPathComponent:@"romfs/romfs.bin"]]) {
-        /* No image to play from: said on the screen instead of the game ending at once (runtime_fail exits). */
-        BOOL zh = [NSLocale.preferredLanguages.firstObject hasPrefix:@"zh"];
-        NSString *app = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleDisplayName"] ?: @"TOTK";   // the Files app's folder name
-        g_no_game_data = copying || image
-            ? [NSString stringWithFormat:(zh ? @"游戏数据还在复制到“文件 › 我的 iPhone › %@ › GameData”，复制完再打开游戏。"
-                                             : @"The game data is still being copied to Files › On My iPhone › %@ › GameData. Open the game again when it is done."), app]
-            : [NSString stringWithFormat:(zh ? @"没有游戏数据。请在 Mac 上用 ios/tools/install_device.py --game-data 把它复制到“文件 › 我的 iPhone › %@ › GameData”。"
-                                             : @"No game data. On the Mac, copy it to Files › On My iPhone › %@ › GameData with ios/tools/install_device.py --game-data."), app];
-        fprintf(stderr, "[totk] no game image: %s\n", g_no_game_data.UTF8String);
-    }
-    /* The startup shaders likewise (build_app.py --ios-game-data documents): install_device.py puts the seed into its own
-       folder in Documents/GameData once per content and writes shader-seed.txt last ("<folder>\n<fingerprint>"), so the app
-       carries none and a new build installs in seconds. Read in place like the app's own (totk_shader_seed.h); folders of
-       earlier seeds are removed in the background. Without either seed the game has no shaders: said on the screen. */
-    NSString *seedDir = [res stringByAppendingPathComponent:@"shader-seed"];
-    NSArray<NSString *> *seedMark = [[NSString stringWithContentsOfFile:[gameData stringByAppendingPathComponent:@"shader-seed.txt"] encoding:NSUTF8StringEncoding error:nil] componentsSeparatedByString:@"\n"];
-    NSString *pushedName = seedMark.count >= 2 && seedMark[1].length == 64 && [seedMark[0] hasPrefix:@"shader-seed-"] && ![seedMark[0] containsString:@"/"] ? seedMark[0] : nil;
-    NSString *pushed = pushedName ? [gameData stringByAppendingPathComponent:pushedName] : nil;
-    BOOL packed = pushed && ![fm fileExistsAtPath:[pushed stringByAppendingPathComponent:@"seed-manifest.json"]] &&
-                  [fm fileExistsAtPath:[pushed stringByAppendingString:@".pack.000"]];
-    if (packed) { g_seed_pack = [pushed stringByAppendingString:@".pack"]; g_seed_unpack_to = pushed; }   // unpacked in viewDidAppear
-    if (pushed && (packed || [fm fileExistsAtPath:[pushed stringByAppendingPathComponent:@"seed-manifest.json"]])) {
-        seedDir = pushed; setenv("TOTK_SHADER_SEED_PUSHED", pushed.fileSystemRepresentation, 1);
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
-            NSFileManager *files = [NSFileManager new];
-            for (NSString *name in [files contentsOfDirectoryAtPath:gameData error:nil] ?: @[])
-                if ([name hasPrefix:@"shader-seed-"] && ![name hasPrefix:pushedName]) [files removeItemAtPath:[gameData stringByAppendingPathComponent:name] error:nil];
-        });
-    } else if (!g_no_game_data && ![fm fileExistsAtPath:[seedDir stringByAppendingPathComponent:@"seed-manifest.json"]]) {
-        BOOL zh = [NSLocale.preferredLanguages.firstObject hasPrefix:@"zh"];
-        g_no_game_data = zh ? @"没有着色器。请在 Mac 上用 ios/tools/install_device.py 重新安装（会把着色器复制到手机上）。"
-                            : @"No shaders. Install the game again from the Mac with ios/tools/install_device.py (it copies them to the device).";
-        fprintf(stderr, "[totk] no shader seed: %s\n", g_no_game_data.UTF8String);
-    }
+    g_no_game_data = game_data_ready(docs, res);   // the game data and the shaders, or what is missing (and waited for)
+    if (g_no_game_data) fprintf(stderr, "[totk] not ready to start: %s\n", g_no_game_data.UTF8String);
+    NSString *seedDir = g_seed_dir ?: [res stringByAppendingPathComponent:@"shader-seed"];   // set again once ready
 #if TARGET_OS_VISION
     setenv("TOTK_OPERATION_MODE","docked",1);
     setenv("TOTK_IOS_DRAWABLE_H","1080",0);
@@ -686,7 +784,8 @@ static void apply_settings(void) {
     // Shaders the shared list lacks (totk_shader_contrib.h), in the Files app for players who want to send them; only the Mac asks.
     // What this app's seed and warm lists (beside the seed: DM_NVN_SHMAP) serve leaves it first, so the Mac sends only the rest.
     NSString *contrib = totk_inbox_claim([docs stringByAppendingPathComponent:@"shader-list-contribution.txt"]);   // this game's file only
-    totk_contrib_prune(contrib, seedDir, seedDir);
+    g_contrib = contrib;
+    if (!g_no_game_data) totk_contrib_prune(contrib, seedDir, seedDir);   // else once the shaders are there (waitForGameData)
     setenv("TOTK_SHADER_CONTRIB",contrib.fileSystemRepresentation,1);
     contrib_settings_sync(contrib);
     totk_inbox_start(contrib, @"ios");   // the player chose "Contribute shaders" (offerShaderUpload): sent while playing
