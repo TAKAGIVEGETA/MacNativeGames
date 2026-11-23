@@ -13,8 +13,10 @@ enum {
     PAD_V143_CLOTH = 176,        PAD_V143_CLOTH_LEN = 19 * 4,      /* cloth / hair clock (patch_secondary_animation) */
     PAD_V143_BOUNCE = 256,       PAD_V143_BOUNCE_LEN = 20,         /* trampoline bounce (patch_slowmo_bounce) */
     PAD_V143_PROMPT = 288,       PAD_V143_PROMPT_LEN = 16,         /* button prompt cache (prompt_cache_install) */
+    PAD_V143_CLARITY_ENV = 304,  PAD_V143_CLARITY_ENV_LEN = 16,    /* UltraCam Clarity EnvPalette (clarity_palette_install) */
     PAD_V143_VERT = 320,         PAD_V143_VERT_LEN = 2 * 304,      /* Vert+: 2 cameras x ASPECT_VSTUB (VR head look) */
     PAD_V143_FADE = 928,         PAD_V143_FADE_LEN = 80,           /* LOD fade increment (patch_fade_increment) */
+    PAD_V143_CLARITY_BIG = 1008, PAD_V143_CLARITY_BIG_LEN = 16,    /* UltraCam Clarity BigPalette (clarity_palette_install) */
     PAD_V143_SIZE = 1024,                                          /* main+0x2bb9c00 to main+0x2bba000 */
 };
 
@@ -23,7 +25,10 @@ _Static_assert(PAD_V143_OUTPUT + PAD_V143_OUTPUT_LEN <= PAD_V143_ASPECT, "1.4.3 
 _Static_assert(PAD_V143_ASPECT + PAD_V143_ASPECT_LEN <= PAD_V143_CLOTH, "1.4.3 padding: aspect overlaps");
 _Static_assert(PAD_V143_CLOTH + PAD_V143_CLOTH_LEN <= PAD_V143_BOUNCE, "1.4.3 padding: cloth overlaps");
 _Static_assert(PAD_V143_BOUNCE + PAD_V143_BOUNCE_LEN <= PAD_V143_PROMPT, "1.4.3 padding: bounce overlaps");
-_Static_assert(PAD_V143_PROMPT + PAD_V143_PROMPT_LEN <= PAD_V143_VERT, "1.4.3 padding: prompt cache overlaps");
+_Static_assert(PAD_V143_PROMPT + PAD_V143_PROMPT_LEN <= PAD_V143_CLARITY_ENV, "1.4.3 padding: prompt cache overlaps");
+_Static_assert(PAD_V143_CLARITY_ENV + PAD_V143_CLARITY_ENV_LEN <= PAD_V143_VERT, "1.4.3 padding: clarity env overlaps");
 _Static_assert(PAD_V143_VERT + PAD_V143_VERT_LEN <= PAD_V143_FADE, "1.4.3 padding: Vert+ overlaps");
-_Static_assert(PAD_V143_FADE + PAD_V143_FADE_LEN <= PAD_V143_SIZE, "1.4.3 padding: fade runs past the padding");
+_Static_assert(PAD_V143_FADE + PAD_V143_FADE_LEN <= PAD_V143_CLARITY_BIG, "1.4.3 padding: fade overlaps");
+_Static_assert(PAD_V143_CLARITY_BIG + PAD_V143_CLARITY_BIG_LEN <= PAD_V143_SIZE, "1.4.3 padding: clarity big runs past the padding");
 _Static_assert(PAD_V143_PROMPT % 8 == 0, "1.4.3 padding: the prompt veneer's address literal must be 8-byte aligned");
+_Static_assert(PAD_V143_CLARITY_ENV % 8 == 0 && PAD_V143_CLARITY_BIG % 8 == 0, "1.4.3 padding: clarity veneer alignment");
