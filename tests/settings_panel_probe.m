@@ -218,6 +218,13 @@ void runtime_feedback_choose(int gyro, int on) { fakeFeedback[gyro] = !!on; }
 int runtime_rumble_gain_locked(void) { return fakeGainLocked; }
 float runtime_rumble_gain(void) { return fakeGain; }
 void runtime_rumble_gain_set(float gain) { fakeGain = gain; }
+void runtime_gyro_cal_start(void) {}
+void runtime_gyro_cal_cancel(void) {}
+int runtime_gyro_cal_state(double *seconds_left) { if (seconds_left) *seconds_left = 0; return GYRO_CAL_IDLE; }
+void runtime_gyro_bias_get(double bias_rad_s[3]) { bias_rad_s[0] = bias_rad_s[1] = bias_rad_s[2] = 0; }
+void runtime_gyro_bias_set(const double bias_rad_s[3]) { (void)bias_rad_s; }
+void runtime_gyro_bias_clear(void) {}
+void runtime_gyro_bias_hook(void (*save)(const double bias_rad_s[3])) { (void)save; }
 /* gfx/nvn/hle_nvn.c's frame lock (its pacing is checked by probe-gfx's present-interval probe). */
 static int fakeLock;
 void nvn_fps_lock_set(int fps) { if (totk_fps_limit_valid(fps)) fakeLock = fps; }
@@ -1143,12 +1150,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
     runtime_input_key_synthetic(18, 1); runtime_input_key_synthetic(18, 1); tick(); runtime_input_key_synthetic(18, 0); tick();
     assert(settingsOpen && fakeSettingsCapture && settingsPanel && !settingsPanel.hidden && settingsPanel.superview == window.contentView);
     assert(NSContainsRect(window.contentView.bounds, settingsPanel.frame));
-    assert(settingsPanel.allRows.count == 32 + 3*TOTK_V143 + BOTW_V190 + (TOTK_V143 && totk_hdr_available() ? SETTINGS_HDR_ROWS : 0));   /* + the HDR rows (PR #1129) */   /* 17 (anisotropy last on the display page, controller
-                                                                 background input on the input page), the user page's
-                                                                 two, then the effects page: FOV, two distances, shadows,
-                                                                 depth of field, FXAA, sharpening and effect switches
-                                                                 (1.4.3, and Breath of the Wild 1.9.0 with its shadow
-                                                                 resolution and AO live), or eight greyed rows */
+    assert(settingsPanel.allRows.count == 33 + 3*TOTK_V143 + BOTW_V190 + (TOTK_V143 && totk_hdr_available() ? SETTINGS_HDR_ROWS : 0));   /* + the HDR rows (PR #1129) + 1 gyro calibration row */
 
     /* Native 4K modes as game_patches.c serves them for 1.2.1 (the fixture swaps in a 4K swapchain); off again before
        the rows below read the mode. */
@@ -1603,7 +1605,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
     settingsPanel.versionLabel.stringValue = versionText; settingsPanel.versionLabel.frame = NSMakeRect(18, 9, 230, 16);
     [settingsPanel selectPage:SETTINGS_PAGE_INPUT];
     assert(!starButton.hidden && settingsPanel.controllerTargets.lastObject == starButton);   /* every page */
-    assert(settingsPanel.rows.count == 12 + TOTK_V143 && !settingsPanel.pages[SETTINGS_PAGE_INPUT].hidden && settingsPanel.pages[SETTINGS_PAGE_DISPLAY].hidden);   /* the screenshot folder is on the 截图分享 page */
+    assert(settingsPanel.rows.count == 13 + TOTK_V143 && !settingsPanel.pages[SETTINGS_PAGE_INPUT].hidden && settingsPanel.pages[SETTINGS_PAGE_DISPLAY].hidden);   /* +1 gyro calibration row; the screenshot folder is on the 截图分享 page */
     assert(settingsPanel.tabs.selectedSegment == SETTINGS_PAGE_INPUT);
     press(18); press(18); assert(settingsOpen && settingsPanel.page == SETTINGS_PAGE_INPUT);
 

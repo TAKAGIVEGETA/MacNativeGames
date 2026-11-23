@@ -147,6 +147,36 @@ static TOTKSettingRow *settings_feedback_row(int gyro) {
  if(!runtime_feedback_present(gyro))t=[t stringByAppendingString:settings_text("（下次启动生效）"," (from the next launch)")];
  return settings_row(t,nil,nil,^int{return runtime_feedback_choice(gyro);},^(int v){runtime_feedback_choose(gyro,v);});
 }
+#ifndef RUNTIME_HAS_GYRO_CAL_DECL
+#define RUNTIME_HAS_GYRO_CAL_DECL 1
+enum { GYRO_CAL_IDLE, GYRO_CAL_COUNTDOWN, GYRO_CAL_SAMPLING, GYRO_CAL_DONE, GYRO_CAL_MOVED, GYRO_CAL_NO_DATA };
+void runtime_gyro_cal_start(void);
+void runtime_gyro_cal_cancel(void);
+int runtime_gyro_cal_state(double *seconds_left);
+void runtime_gyro_bias_get(double bias_rad_s[3]);
+void runtime_gyro_bias_set(const double bias_rad_s[3]);
+void runtime_gyro_bias_clear(void);
+void runtime_gyro_bias_hook(void (*save)(const double bias_rad_s[3]));
+#endif
+/* Gyro calibration (runtime/motion_fusion.c): the first line is the state (the countdown, the result, or the bias kept), the others
+   start it (5 s to lay the controller still, then 3 s of sampling) or drop it; the bias is saved in gyro-bias.txt. */
+__attribute__((unused)) static NSString *settings_gyro_cal_text(void) {
+ double left=0;int st=runtime_gyro_cal_state(&left);
+ if(st==GYRO_CAL_COUNTDOWN)return [NSString stringWithFormat:@(TOTK_UI("倒计时 %d 秒：请把手柄放平放稳","Lay it still: %d s")),(int)ceil(left)];
+ if(st==GYRO_CAL_SAMPLING)return settings_text("校准中，请勿触碰手柄…","Calibrating, do not touch…");
+ if(st==GYRO_CAL_DONE)return settings_text("校准完成，已保存","Calibrated and saved");
+ if(st==GYRO_CAL_MOVED)return settings_text("失败：手柄在动，请重试","Failed: it moved, try again");
+ if(st==GYRO_CAL_NO_DATA)return settings_text("失败：没有陀螺仪数据","Failed: no gyro data");
+ double b[3];runtime_gyro_bias_get(b);
+ if(!b[0]&&!b[1]&&!b[2])return settings_text("未校准","Not calibrated");
+ return [NSString stringWithFormat:@(TOTK_UI("已校准（偏置 %.2f°/秒）","Calibrated (bias %.2f°/s)")),sqrt(b[0]*b[0]+b[1]*b[1]+b[2]*b[2])*180/M_PI];
+}
+__attribute__((unused)) static TOTKSettingRow *settings_gyro_cal_row(void) {
+ TOTKSettingRow *r=settings_row(settings_text("陀螺仪校准","Gyro calibration"),
+  @[settings_gyro_cal_text(),settings_text("开始校准（先倒数 5 秒）","Start (5 s countdown)"),settings_text("清除校准","Clear calibration")],@[@0,@1,@2],
+  ^int{return 0;},^(int v){if(v==1)runtime_gyro_cal_start();else if(v==2)runtime_gyro_bias_clear();});
+ r.firstTitle=^NSString *{return settings_gyro_cal_text();};return r;
+}
 /* Rumble strength in thousandths: 0.5x to 4x, and the strength in force when rumble-gain.txt holds another one. */
 static int settings_gain_now(void) { return (int)fmax(1, lroundf(runtime_rumble_gain()*1000)); }
 __attribute__((unused)) static TOTKSettingRow *settings_gain_row(void) {

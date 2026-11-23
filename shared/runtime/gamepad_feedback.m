@@ -27,6 +27,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include "runtime.h"
+#ifndef RUNTIME_HAS_GYRO_CAL_DECL
+#define RUNTIME_HAS_GYRO_CAL_DECL 1
+enum { GYRO_CAL_IDLE, GYRO_CAL_COUNTDOWN, GYRO_CAL_SAMPLING, GYRO_CAL_DONE, GYRO_CAL_MOVED, GYRO_CAL_NO_DATA };
+void runtime_gyro_cal_start(void);
+void runtime_gyro_cal_cancel(void);
+int runtime_gyro_cal_state(double *seconds_left);
+void runtime_gyro_bias_get(double bias_rad_s[3]);
+void runtime_gyro_bias_set(const double bias_rad_s[3]);
+void runtime_gyro_bias_clear(void);
+void runtime_gyro_bias_hook(void (*save)(const double bias_rad_s[3]));
+#endif
 #include "feedback_settings.h"
 
 #import <CoreHaptics/CoreHaptics.h>
@@ -893,10 +904,32 @@ static void rumble_take(GCController *c, const char *name) {   /* main queue */
         hid_rumble_attach(c);   /* rumbleOwner = c when a profile's device opens */
     }
 }
+/* ---- gyro bias (settings panel "Gyro calibration"; the math is in motion_fusion.c) ----
+   gyro-bias.txt next to controls.txt: the bias in degrees a second on the controller's raw axes, "x,y,z"; none means 0. */
+static void gyro_bias_save(const double b[3]) {   /* any queue: a calibration finished or the bias was cleared */
+    if (!b[0] && !b[1] && !b[2]) { runtime_setting_remove("gyro-bias.txt"); return; }
+    char word[96]; snprintf(word, sizeof word, "%.6f,%.6f,%.6f", b[0] * 180 / M_PI, b[1] * 180 / M_PI, b[2] * 180 / M_PI);
+    runtime_setting_save("gyro-bias.txt", word, "gyro calibration");
+}
+static void gyro_bias_load(void) {   /* main queue, once */
+    runtime_gyro_bias_hook(gyro_bias_save);
+    char word[96];
+    if (!runtime_setting_word("gyro-bias.txt", word, sizeof word)) return;
+    double d[3]; int used = 0;
+    if (sscanf(word, " %lf , %lf , %lf %n", &d[0], &d[1], &d[2], &used) != 3 || used <= 0 || !isfinite(d[0] + d[1] + d[2]) ||
+        fabs(d[0]) > 60 || fabs(d[1]) > 60 || fabs(d[2]) > 60) {
+        fprintf(stderr, "[gyro] gyro-bias.txt is not three numbers of degrees a second within 60: ignored\n"); return;
+    }
+    const double b[3] = {d[0] * M_PI / 180, d[1] * M_PI / 180, d[2] * M_PI / 180};
+    runtime_gyro_bias_set(b);
+    fprintf(stderr, "[gyro] saved calibration: bias (%+.4f %+.4f %+.4f) deg/s\n", d[0], d[1], d[2]);
+}
+
 /* The motion goes to c: its GCMotion, or the HID sensor of a pad GameController gives none. */
 static void motion_take(GCController *c, const char *name) {   /* main queue */
     static dispatch_once_t once;
     dispatch_once(&once, ^{
+        gyro_bias_load();
         const char *axes = getenv("TOTK_GYRO_AXES"); int r = runtime_motion_axes(axes);
         if (r < 0) runtime_fail("TOTK_GYRO_AXES must name x, y and z once each, e.g. \"-x,y,-z\"");
         if (r > 0) fprintf(stderr, "[gyro] axes remapped by TOTK_GYRO_AXES=%s\n", axes);
