@@ -102,9 +102,19 @@ static void vr_recenter_key(void){if(vr_on()&&vr_recenter){vr_recenter();fprintf
    game's menu in the default layout, and against one picture, which also renders once. A real key only: scripted presses
    keep U as the Y button (runtime_input_key_synthetic). U is in no default layout (tests/test_keyboard_map.c); a player
    who binds it to a game action keeps that action and has no switch. */
-enum { KEY_VR_DSTEREO = 32 };
+enum { KEY_VR_DSTEREO = 32, KEY_FILTER_F1 = 122, KEY_FILTER_F2 = 120, KEY_FILTER_F3 = 99, KEY_FILTER_F4 = 118 };
 extern int vr_dstereo(void) __attribute__((weak_import));
 extern void vr_set_dstereo(int on) __attribute__((weak_import));
+extern void runtime_filter_hotkey(int mode) __attribute__((weak_import));
+static int filter_key_mode(unsigned code){
+ switch(code){
+ case KEY_FILTER_F1:return 0;
+ case KEY_FILTER_F2:return 1;
+ case KEY_FILTER_F3:return 2;
+ case KEY_FILTER_F4:return 3;
+ default:return -1;
+ }
+}
 static void vr_dstereo_key(void){
 #ifdef TOTK_GAME_V143
  extern void dm_gfx_set_flag(const char *name,int v);
@@ -130,11 +140,12 @@ void runtime_input_key_synthetic(unsigned code,int down){if(code>=128)return;pth
 void runtime_input_key(unsigned code,int down){
  if(code>=128||ignore_user())return;if(down)user_input("keyboard");
  if(down&&runtime_prompt_note_input)runtime_prompt_note_input(PROMPT_KEYBOARD);
- pthread_mutex_lock(&inputLock);int press=down&&!held[code];held[code]=(unsigned char)!!down;held_changed_locked();int shot=press&&screenshot_input_locked((int)code),stereo_key=press&&code==KEY_VR_DSTEREO&&keymap_action_of(&keyMap,(int)code,NULL)<0;pthread_mutex_unlock(&inputLock);
+ pthread_mutex_lock(&inputLock);int press=down&&!held[code];held[code]=(unsigned char)!!down;held_changed_locked();int shot=press&&screenshot_input_locked((int)code),stereo_key=press&&code==KEY_VR_DSTEREO&&keymap_action_of(&keyMap,(int)code,NULL)<0,fmode=filter_key_mode(code),filter_key=press&&fmode>=0&&keymap_action_of(&keyMap,(int)code,NULL)<0;pthread_mutex_unlock(&inputLock);
  if(press&&code==KEY_SETTINGS)runtime_settings_toggle();
  if(press&&code==KEY_VR_VIEW)vr_view_key();
  if(press&&code==KEY_VR_RECENTER)vr_recenter_key();
  if(stereo_key)vr_dstereo_key();
+ if(filter_key&&runtime_filter_hotkey)runtime_filter_hotkey(fmode);
  if(shot)screenshot_input((int)code);
 }
 /* A mouse button in mouse mode (runtime/gamepad.m: 0 left, 1 right, 2 middle, 3 and 4 the side buttons). */

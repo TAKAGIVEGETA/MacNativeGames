@@ -325,7 +325,7 @@ static int front_modifier_down(NSEvent *e){
  /* AppKit normally handles menu equivalents first. If a Command event reaches
     this view, offer it to the menu rather than turning its key into gameplay. */
  if(e.modifierFlags&NSEventModifierFlagCommand){[NSApp.mainMenu performKeyEquivalent:e];return;}
- if(textEntryOpen)return;if(settingsOpen&&e.keyCode!=18){if(e.keyCode==53)settings_show(0);return;}runtime_input_key(e.keyCode,1);
+ if(textEntryOpen)return;if(settingsOpen&&e.keyCode!=18&&e.keyCode!=122&&e.keyCode!=120&&e.keyCode!=99&&e.keyCode!=118){if(e.keyCode==53)settings_show(0);return;}runtime_input_key(e.keyCode,1);
 }
 -(void)keyUp:(NSEvent *)e{runtime_input_key(e.keyCode,0);}
 /* Shift, Control and Option, left and right apart, are keys of the layout (keyboard_map.h); they come as flag changes.

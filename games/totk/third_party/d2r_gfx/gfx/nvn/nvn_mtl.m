@@ -3305,14 +3305,18 @@ static int ub_skip(const char *key) {   // 本相要不要丢掉这个片元着�
     return 0;
 }
 static _Atomic int g_hdr_frame_enabled;
+static _Atomic int g_filmic_frame_enabled;
 static _Atomic int g_hdr_shader_failed;
 static int g_hdr_draw_native;
 static TotkHDRUniform g_hdr_frame_uniform;
 static float g_hdr_frame_peak=1;
 void mtl_set_frame(uint64_t f) {
     int hdr=totk_hdr_active() && !atomic_load(&g_hdr_shader_failed);
+    int filmic=dm_gfx_filmic_on() && !atomic_load(&g_hdr_shader_failed);
     atomic_store(&g_hdr_frame_enabled,hdr);
+    atomic_store(&g_filmic_frame_enabled,filmic);
     g_hdr_frame_peak=totk_hdr_uniform_snapshot(&g_hdr_frame_uniform,front_hdr_headroom?front_hdr_headroom():1,hdr);
+    g_hdr_frame_uniform.v[14]=filmic?1.0f:0.0f;
     atomic_store(&g_cur_frame,f);if(g_ub_n)ub_frame(f);
 }
 // GPU 计时登记：提交前 gpu_tag_begin(帧)，完成时 gpu_tag_done(帧, GPU 起, GPU 止)（CACurrentMediaTime 基准秒）。
@@ -11573,7 +11577,7 @@ static void *pso_get_p(NvProg *pr, MTLRenderPassDescriptor *unused) {
         k.blend[0].dst_rgb=hdr_shadow_rgb_factor(k.blend[0].dst_rgb);
     }
     if (g_pass.layered) k.a2c |= PSO_LAYERED;   // TOTK: layered pass (see g_lay)
-    int hdr = fs && fs->hdr_fn && atomic_load(&g_hdr_frame_enabled);   // HDR / EDR on: the shader's HDR twin (PR #1129)
+    int hdr = fs && fs->hdr_fn && (atomic_load(&g_hdr_frame_enabled) || (fs->hdr_compose == 1 && atomic_load(&g_filmic_frame_enabled)));   // HDR / EDR or Filmic on: the shader's HDR/Filmic twin (PR #1129)
     if (hdr) k.a2c |= PSO_HDR;
     if (g_mfx.role) k.a2c |= (uint32_t)g_mfx.role << 2;   // TOTK_MFX: scene / UI copy variant (see pso_desc)
     if (g_pso_lmap) { memcpy(k.lmap, g_pso_lmap, 8); k.fsfn = (__bridge void *)g_pso_fsfn; }
@@ -14554,10 +14558,11 @@ static void bz_bind(id<MTLCommandEncoder> en) {
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
     bind_trace(sh, nvn_stage);
     if (nvn_stage == 1 && !metal_vertex && sh->has_bz) bz_bind(en);
-    if(nvn_stage==1 && sh->hdr_fn && atomic_load(&g_hdr_frame_enabled)) {   /* the HDR twin's uniform, only with HDR on (PR #1129) */
+    if(nvn_stage==1 && sh->hdr_fn && (atomic_load(&g_hdr_frame_enabled) || (sh->hdr_compose==1 && atomic_load(&g_filmic_frame_enabled)))) {   /* the HDR/Filmic twin's uniform (PR #1129) */
         /* Immutable arena bytes survive queued rendering; never overwrite an in-flight mode. */
         id<MTLBuffer> b=nil;size_t off=arena_alloc(sizeof(TotkHDRUniform),&b);
         TotkHDRUniform config=g_hdr_frame_uniform;config.v[0]=g_hdr_draw_native?1.0f:0.0f;
+        config.v[14]=(sh->hdr_compose==1 && atomic_load(&g_filmic_frame_enabled))?1.0f:0.0f;
         memcpy((char *)b.contents+off,&config,sizeof config);
         enc_r_args((id<MTL4RenderCommandEncoder>)en,MTLRenderStageFragment,b.gpuAddress+off,30);
     }
@@ -16020,6 +16025,7 @@ static int dsnap_prepare(const tex_t *d) {
 static int csnap_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_COLOR_SNAP"); on = !(e && !strcmp(e, "0")); if (!on) MLOG("TOTK_COLOR_SNAP=0: a draw that samples its own colour target off its pixel reads the target itself"); } return on; }
 /* Does fs read the texture of binding b only at positions that depend on another texture read (nvn_fbdep.h)? Asked once per shader and register. */
 static int csnap_dep_reg(NvShader *fs, const nvn_rbind *b) {
+    if (fs && fs->hdr_compose == 1 && b->reg == 0 && atomic_load(&g_filmic_frame_enabled)) return 1;
     unsigned w = b->reg >> 6; uint64_t m = UINT64_C(1) << (b->reg & 63);
     if (!(fs->csnap_known[w] & m)) { if (nvn_fbdep_dependent(sh_src(fs), b->aid)) fs->csnap_dep[w] |= m; fs->csnap_known[w] |= m; }
     return (fs->csnap_dep[w] & m) != 0;
@@ -16076,6 +16082,12 @@ static void csnap_draw(NvProg *pr, uint64_t *rs, int *n) {
         for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; uint64_t h;
             if (b->kind == NVN_RB_IMG) h = b->reg < 32 ? S.img[sh->stage][b->reg] : 0; else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = b->reg < 128 ? S.tex[sh->stage][b->reg] : 0; else continue;
             if (h && h_ser(h) == ser) { csnap_clear(); return; } } }
+    if (g_mfxup_out && (__bridge void *)fs == (__bridge void *)g_mfxup_sh) {
+        csnap_clear();
+        int m = 0; for (int i = 0; i < *n; i++) if (rs[i] != ser) rs[m++] = rs[i];
+        *n = m;
+        return;
+    }
     if (g_csnap_tid != tid || g_csnap_ser != ser || !g_enc) {   // no copy of it yet in this run of readers; no open pass: the draw the copy was made for never drew (empty scissor, deferred), so the copy can be old
         csnap_clear();
         uint64_t s_; int lv, sl; rt_sub(&R.rt, j, &s_, &lv, &sl);
@@ -16125,7 +16137,7 @@ static id<MTLFunction> att_fb_take(NvProg *pr, uint64_t *rs, int *n) {
        write depth (b626c0ae at Kakariko, 65 draws a frame) were stored before and reloaded around: two G-buffer stores
        and loads (~190 MB) a frame (2026-10-25). */
     int depth_ok = !fs || !fs->writes_depth || (R.rt.depth && (!g_enc || g_pass.hd));
-    if (!att_fb_on() || !*n || !fs || !depth_ok || !R.has_rt || g_pso_lmap || g_mfx.role || g_fz.active || g_rt_merged) return nil;
+    if (!att_fb_on() || !*n || !fs || !depth_ok || !R.has_rt || g_pso_lmap || g_mfx.role || g_fz.active || g_rt_merged || (fs->hdr_compose == 1 && atomic_load(&g_filmic_frame_enabled))) return nil;
     { float bc[8][4]; int ba[8], bn; unsigned bx[8]; samp_par bp[8]; if (border_key(fs, 1, bc, ba, bx, bp, &bn)) return nil; }   // one specialised fragment function per draw (a border variant)
     int aid[8], att[8], k = 0, nt = 0; uint64_t took[8];
     for (int i = 0; i < fs->rf.nb; i++) { const nvn_rbind *b = &fs->rf.b[i]; uint64_t h;
@@ -16149,7 +16161,7 @@ static id<MTLFunction> att_fb_take(NvProg *pr, uint64_t *rs, int *n) {
         for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; uint64_t h;
             if (b->kind == NVN_RB_IMG) h = b->reg < 32 ? S.img[sh->stage][b->reg] : 0; else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = b->reg < 128 ? S.tex[sh->stage][b->reg] : 0; else continue;
             if (h && has_ser(took, nt, h_ser(h))) return nil; } }
-    BOOL hdr = fs->hdr_fn && atomic_load(&g_hdr_frame_enabled);
+    BOOL hdr = fs->hdr_fn && (atomic_load(&g_hdr_frame_enabled) || (fs->hdr_compose == 1 && atomic_load(&g_filmic_frame_enabled)));
     id<MTLFunction> fn = fs_fn_fbread(fs, aid, att, k, hdr);
     if (fn) { int o = 0; g_pso_fbrec[0] = 0; for (int i = 0; i < k && o < (int)sizeof g_pso_fbrec - 24; i++) o += snprintf(g_pso_fbrec + o, sizeof g_pso_fbrec - o, "%d:%d;", aid[i], att[i]); }
     if (!fn) return nil;
@@ -17028,7 +17040,7 @@ planned:
                 if (b->stage >= 0 && b->stage < 6 && b->first >= 0 && b->first + b->n <= lim) for (int k = 0; k < b->n; k++) { if (hq.op == OP_BIND_IMG) i2[b->stage][b->first + k] = b->h[k]; else t2[b->stage][b->first + k] = b->h[k]; } }
         }
         NvProg *pr2 = pg2 ? prog_get(pg2) : nil; NvShader *vs2 = pr2 ? pr2->sh[0] : nil, *fs2 = pr2 ? pr2->sh[1] : nil;
-        if (!vs2 || !fs2) return;
+        if (!vs2 || !fs2 || (fs2->hdr_compose == 1 && atomic_load(&g_filmic_frame_enabled))) return;
         int touches = 0;
         for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr2->sh[st]; if (!sh || sh->stage >= 6) continue;
             for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *bb = &sh->rf.b[i]; uint64_t h;
@@ -17168,7 +17180,7 @@ static int uv_proof(NvShader *vs, int locn, const p_draw *dw, const p_draw_idx *
 // One draw of the later pass: verify and produce the specialization. Returns 0 = cannot be proven (the caller ends the merged render pass and reopens with the original targets)
 static int fz_p2_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di, uint8_t lmap[8], __strong id<MTLFunction> *fn) {
     NvShader *vs = pr->sh[0], *fs = pr->sh[1]; *fn = nil;
-    if (!vs || !fs) { PD("F %llu 证不出：无顶点 / 片元着色器", g_stat_pass); return 0; }
+    if (!vs || !fs || (fs->hdr_compose == 1 && atomic_load(&g_filmic_frame_enabled))) { PD("F %llu 证不出：无顶点 / 片元着色器", g_stat_pass); return 0; }
     if (!g_fz.rt2.depth && R.rt.depth && (S.ds.dt || S.ds.dw || S.ds.st)) { PD("F %llu 证不出：深度来自前一个通道而本次绘制开了深度模板测试", g_stat_pass); return 0; }
     int fx[32]; for (int i = 0; i < 32; i++) fx[i] = -1; uint8_t fbmask = 0;
     for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || sh->stage >= 6) continue;
@@ -19668,8 +19680,8 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!g_enc && tbdr_on()) hoist_try();   // 先把夹在本通道与其续用之间的纯清除通道提前做掉（rp_begin_ex 之前，不占本通道） | First hoist and execute the pure-clear render passes sandwiched between this render pass and its continuation (before rp_begin_ex, not occupying this render pass)
     // 推迟判定在 hoist_try 之后：被提前的纯清除通道在前瞻里跳过，P 的同目标续段才认得出来
     // The deferral decision comes after hoist_try: hoisted pure-clear render passes are skipped in the lookahead, and only then can P's same-target continuation segment be recognized
-    if (!g_enc && (tbdr_on() || defer_chain_on()) && !defer_has_in_p() && !g_defer_replaying && !g_fz.active && !g_fz_checking && g_exec_next) { defer_try(dw, di); if (g_defer_cur->active && g_defer_cur->in_p) { g_draw_skip[7]++; return; } }
-    if (!g_enc && tbdr_on() && !g_fz_checking) fuse_try();   // 可读 tile 通道合并缺省开；结构 / 本像素证明不成立仍退回普通通道，CHECK 重画时不重入 | Readable tile render pass merge is on by default; when the structure / same-pixel proof does not hold it still falls back to a normal render pass, and it is not re-entered during the CHECK redraw
+    if (!g_enc && (tbdr_on() || defer_chain_on()) && !cs_tid && !defer_has_in_p() && !g_defer_replaying && !g_fz.active && !g_fz_checking && g_exec_next) { defer_try(dw, di); if (g_defer_cur->active && g_defer_cur->in_p) { g_draw_skip[7]++; return; } }
+    if (!g_enc && tbdr_on() && !cs_tid && !g_fz_checking) fuse_try();   // 可读 tile 通道合并缺省开；结构 / 本像素证明不成立仍退回普通通道，CHECK 重画时不重入 | Readable tile render pass merge is on by default; when the structure / same-pixel proof does not hold it still falls back to a normal render pass, and it is not re-entered during the CHECK redraw
 frz_plain:;
     int need = g_enc || !tbdr_on() ? 3 : pass_ds_need(), mode = defer_q_draw ? 0 : need == 0 ? 2 : need == 2 ? 3 : need == 1 ? 4 : 0;   // 2 都不挂 3 只挂模板 4 只挂深度 | 2 attach neither, 3 attach stencil only, 4 attach depth only
     int skip_d = mode != 0;
@@ -19683,6 +19695,9 @@ frz_plain:;
     if (!g_mfx.scene_done && g_mfx.canvas && R.rt.n > 0 && R.rt.color[0] && R.rt.color[0]->serial == g_mfx.canvas && pr && pr->sh[0] && MFX_UI_DRAW(pr) && mfx_enabled())
         mfx_snapshot_scene();   // TOTK_MFX: first UI draw into the canvas: copy the finished scene first
     if (!g_uw_ui && uw_on_canvas() && pr && pr->sh[0] && UW_UI_BEGINS(pr)) g_uw_ui = 1; BOTW_MFX_NO_UI_SCENE()   // key 4: the UI begins | BOTW key 2 (every draw, not part of the if): a frame without UI takes the canvas as its scene
+#if !defined(GAME_BOTW) && !defined(GAME_NS2)   /* TOTK: the colour snapshot (csnap) */
+    if (cs_tid && !g_csnap_tid) csnap_again(cs_tid, cs_ser);
+#endif
     /* TOTK: unretained: g_enc holds the encoder (the encode-stage sentinel when streamed) until rp_end, and every path below
        that ends the pass returns without touching en again; as a strong local it was a retain + release on every draw.
        defer_replay draws whole replayed draws, which may end the pass: en_keep holds the encoder over it as before. */

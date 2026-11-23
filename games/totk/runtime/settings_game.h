@@ -135,6 +135,8 @@ double runtime_fov_scale(void); void runtime_fov_scale_set(double k); int runtim
 double runtime_shadow_scale(void); void runtime_shadow_scale_set(double k); int runtime_shadow_scale_locked(void);
 void runtime_dof_set(int on); int runtime_dof_on(void);   /* game_patches_v143.c */
 void runtime_clarity_set(int on); int runtime_clarity_on(void);   /* clarity_v143.h */
+int runtime_filter_mode(void); void runtime_filter_mode_set(int mode);
+const char *runtime_filter_mode_word(int mode); int runtime_filter_mode_parse(const char *word);
 void dm_gfx_fxaa_set(int on); int dm_gfx_fxaa_on(void); void dm_gfx_sharpen_set(int pct); int dm_gfx_sharpen(void);   /* gfx/nvn/totk_finish.h */
 void dm_gfx_smaa_set(int on); int dm_gfx_smaa_on(void);   /* optional spatial SMAA, before the UI */
 int dm_gfx_smaa_quality(void); void dm_gfx_smaa_quality_set(int q);
@@ -229,8 +231,8 @@ static void settings_effects_restore(void) {
  }
  if(settings_read_number("graphics-sharpen.txt",0,100,&d))dm_gfx_sharpen_set((int)d);
  if(runtime_setting_word("graphics-dof.txt",word,sizeof word)&&!strncmp(word,"off",3))runtime_dof_set(0);
- if(getenv("TOTK_CLARITY"))runtime_clarity_set(strcmp(getenv("TOTK_CLARITY"),"0")!=0);
- else if(runtime_setting_word("graphics-clarity.txt",word,sizeof word))runtime_clarity_set(!strncmp(word,"on",2)||!strncmp(word,"1",1));
+ if(getenv("TOTK_CLARITY"))runtime_filter_mode_set(runtime_filter_mode_parse(getenv("TOTK_CLARITY")));
+ else if(runtime_setting_word("graphics-clarity.txt",word,sizeof word))runtime_filter_mode_set(runtime_filter_mode_parse(word));
  if(!runtime_far_scale_locked()&&settings_read_number("graphics-far.txt",0.1,1000,&d))runtime_far_scale_set(d/100);
 }
 #elif defined(GAME_BOTW190)
@@ -578,8 +580,13 @@ static NSArray<TOTKSettingRow *> *settings_effect_rows(void) {
    ^int{return dm_gfx_smaa_quality();},^(int v){dm_gfx_smaa_quality_set(v);settings_aa_save();})];
  [rows addObject:settings_row(settings_text("景深","Depth of field"),nil,nil,^int{return runtime_dof_on();},^(int v){
   runtime_dof_set(v);runtime_setting_save("graphics-dof.txt",v?"on":"off","depth of field");})];
- [rows addObject:settings_row(settings_text("Clarity 滤镜（UltraCam）","Clarity filter (UltraCam)"),nil,nil,^int{return runtime_clarity_on();},^(int v){
-  runtime_clarity_set(v);runtime_setting_save("graphics-clarity.txt",v?"on":"off","Clarity palette filter");})];
+ [rows addObject:settings_row(settings_text("画面滤镜（F1–F4）","Picture filter (F1–F4)"),
+  @[settings_text("关（游戏原样 · F1）","Off (as the game has it · F1)"),
+    settings_text("Clarity（UltraCam · F2）","Clarity (UltraCam · F2)"),
+    settings_text("胶片风（Cemu · F3）","Filmic (Cemu · F3)"),
+    settings_text("Clarity + 胶片风（F4）","Clarity + Filmic (F4)")],
+  @[@0,@1,@2,@3],^int{return runtime_filter_mode();},^(int v){
+   runtime_filter_mode_set(v);runtime_setting_save("graphics-clarity.txt",runtime_filter_mode_word(v),"picture filter");})];
  [rows addObject:settings_row(settings_text("锐化","Sharpening"),@[settings_text("关（游戏原样）","Off (as the game has it)"),@"25%",@"50%",@"75%",@"100%"],@[@0,@25,@50,@75,@100],
   ^int{return dm_gfx_sharpen();},^(int v){dm_gfx_sharpen_set(v);settings_save_int("graphics-sharpen.txt",v,"sharpening");})];
  for(int i=0;i<dm_gfx_fx_count();i++){
@@ -626,7 +633,7 @@ static void settings_effects_reset(void) {
  if(!runtime_lod_scale_locked())runtime_lod_scale_set(1);
  if(!runtime_far_scale_locked())runtime_far_scale_set(1);
  if(!runtime_shadow_scale_locked())runtime_shadow_scale_set(1);
- dm_gfx_fxaa_quality_set(0);dm_gfx_aa_method_set(1);dm_gfx_smaa_quality_set(2);dm_gfx_sharpen_set(0);runtime_dof_set(1);runtime_clarity_set(0);
+ dm_gfx_fxaa_quality_set(0);dm_gfx_aa_method_set(1);dm_gfx_smaa_quality_set(2);dm_gfx_sharpen_set(0);runtime_dof_set(1);runtime_filter_mode_set(0);
  for(int i=0;i<dm_gfx_fx_count();i++)if(!dm_gfx_fx_on(i))dm_gfx_fx_set(i,1);
  for(const char *const *f=(const char *const[]){"graphics-fov.txt","graphics-lod.txt","graphics-far.txt","graphics-fxaa.txt","graphics-smaa-quality.txt","graphics-aa-method.txt","graphics-fxaa-quality.txt","graphics-sharpen.txt","graphics-effects.txt","graphics-shadow.txt","graphics-clarity.txt","graphics-dof.txt",NULL};*f;f++)
   runtime_setting_remove(*f);
@@ -884,6 +891,19 @@ static void settings_aa_rebuild(void) {
  if(scroll){CGFloat y=fmax(0,NSMaxY(scroll.documentView.bounds)-scroll.contentSize.height-top);
   [scroll.contentView scrollToPoint:NSMakePoint(0,y)];[scroll reflectScrolledClipView:scroll.contentView];}
  [settingsPanel controllerHighlight];
+}
+void runtime_filter_hotkey(int mode) {
+ mode&=3;
+ runtime_filter_mode_set(mode);
+ runtime_setting_save("graphics-clarity.txt",runtime_filter_mode_word(mode),"picture filter");
+ static const char *const zh[4]={"关（游戏原样 · F1）","Clarity（UltraCam · F2）","胶片风（Cemu · F3）","Clarity + 胶片风（F4）"};
+ static const char *const en[4]={"Off (F1)","Clarity (UltraCam · F2)","Filmic (Cemu · F3)","Clarity + Filmic (F4)"};
+ fprintf(stderr,"[totk] picture filter hotkey: %s\n",en[mode]);
+ dispatch_async(dispatch_get_main_queue(),^{
+  if(!window||!settingsOpen||!settingsPanel)return;
+  [settingsPanel refresh];
+  [settingsPanel note:[NSString stringWithFormat:@(TOTK_UI("画面滤镜：%s","Picture filter: %s")),TOTK_UI(zh[mode],en[mode])]];
+ });
 }
 #endif
 #endif

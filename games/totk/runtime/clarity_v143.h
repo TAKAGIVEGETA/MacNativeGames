@@ -14,6 +14,8 @@
 
 #if !TARGET_OS_IPHONE
 static _Atomic int g_clarity_on;
+extern void dm_gfx_filmic_set(int on);
+extern int dm_gfx_filmic_on(void);
 
 int runtime_clarity_on(void) {
     return atomic_load_explicit(&g_clarity_on, memory_order_relaxed);
@@ -22,6 +24,38 @@ int runtime_clarity_on(void) {
 void runtime_clarity_set(int on) {
     atomic_store_explicit(&g_clarity_on, !!on, memory_order_relaxed);
     fprintf(stderr, "[totk] UltraCam Clarity palette %s\n", on ? "on" : "off");
+}
+
+/* 4-way picture filter mode:
+   0: Off (game original)
+   1: Clarity (UltraCam in-engine weather/lighting palette)
+   2: Filmic (Cemu Preset 6 post-processing tone map + film pass)
+   3: Clarity + Filmic */
+int runtime_filter_mode(void) {
+    return (runtime_clarity_on() ? 1 : 0) | (dm_gfx_filmic_on() ? 2 : 0);
+}
+
+void runtime_filter_mode_set(int mode) {
+    mode &= 3;
+    runtime_clarity_set(mode & 1);
+    dm_gfx_filmic_set((mode >> 1) & 1);
+}
+
+const char *runtime_filter_mode_word(int mode) {
+    switch (mode & 3) {
+    case 1: return "clarity";
+    case 2: return "filmic";
+    case 3: return "both";
+    default: return "off";
+    }
+}
+
+int runtime_filter_mode_parse(const char *word) {
+    if (!word) return 0;
+    if (!strncmp(word, "both", 4) || !strncmp(word, "3", 1)) return 3;
+    if (!strncmp(word, "filmic", 6) || !strncmp(word, "2", 1)) return 2;
+    if (!strncmp(word, "clarity", 7) || !strncmp(word, "on", 2) || !strncmp(word, "1", 1)) return 1;
+    return 0;
 }
 
 typedef struct { float v[4]; } ClarityFloat4;
