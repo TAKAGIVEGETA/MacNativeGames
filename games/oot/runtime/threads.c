@@ -51,6 +51,15 @@
 #define PROCESS_CORE_MASK  7u
 #endif
 #define WAITERS_BIT   0x40000000u
+/* Uncontended lock SVC fast path (PR #2132): a waiter always sets WAITERS_BIT before blocking (lock_acquire_for) and
+   hand-off only exists when that bit is set, so a word without it has no waiter and needs no global lock G.
+   TOTK_LOCK_FAST=0 restores the locked path for A/B. */
+static int g_lock_fast = -1;
+static int lock_fast_on(void) {
+    if (g_lock_fast < 0) { const char *e = getenv("TOTK_LOCK_FAST"); g_lock_fast = !(e && !strcmp(e, "0"));
+        if (!g_lock_fast) fprintf(stderr, "[threads] lock SVC fast path off (TOTK_LOCK_FAST=0)\n"); }
+    return g_lock_fast;
+}
 #define H_CUR_THREAD  0xFFFF8000u
 
 enum { O_FREE, O_THREAD, O_EVENT_R, O_EVENT_W, O_SESSION, O_TMEM };   // O_SESSION / O_TMEM: IPC objects owned by ipc.c
@@ -71,7 +80,7 @@ typedef struct thr {
     int closed;                // 句柄已关：与 exited 同时成立才释放对象（Horizon：线程对象随最后一个引用消失） | Handle closed: the object is freed only when this holds together with exited (Horizon: the thread object goes away with the last reference)
     uint64_t nsvc;             // SVC 次数（现场导出用） | SVC count (for the state dump)
     mach_port_t mport;         // 宿主线程端口（取 CPU 时间） | Host thread port (to get CPU time)
-    uint32_t qos;
+    uint32_t qos; int qos_pending;
     int cur_core;              // virtual core held while running guest code, -1 while blocked / not started
     int preempt;               // a higher-priority thread waits for this thread's core
     uint64_t cseq, core_since; struct thr *cnext;
@@ -90,6 +99,35 @@ typedef struct thr {
 #endif
 } thr_t;
 static thr_t *g_all;
+
+#ifdef GAME_OOT
+#define QOS_MAP_DEFAULT 1
+#else
+#define QOS_MAP_DEFAULT 0
+#endif
+static int g_qos_map = -1, g_qos_e1 = 45, g_qos_e2 = 58;   // <=45 keeps OOT main (44) + NVN present/render (45) on USER_INTERACTIVE; 46..58 USER_INITIATED; >58 UTILITY (E-cores)
+static int qos_map_on(void) {
+    int v = __atomic_load_n(&g_qos_map, __ATOMIC_ACQUIRE);
+    if (v < 0) {
+        const char *e = getenv("OOT_QOS_MAP"); if (!e) e = getenv("DM_QOS_MAP");
+        const char *d = getenv("OOT_QOS_EDGES"); if (!d) d = getenv("DM_QOS_EDGES");
+        if (d) sscanf(d, "%d,%d", &g_qos_e1, &g_qos_e2);
+        v = e && *e ? atoi(e) != 0 : QOS_MAP_DEFAULT;
+        int exp = -1;
+        if (__atomic_compare_exchange_n(&g_qos_map, &exp, v, 0, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE) && v)
+            fprintf(stderr, "[threads] guest priority -> macOS QoS mapping on (<=%d user-interactive, <=%d user-initiated, >%d utility; OOT_QOS_MAP=0 turns it off)\n", g_qos_e1, g_qos_e2, g_qos_e2);
+        v = __atomic_load_n(&g_qos_map, __ATOMIC_ACQUIRE);
+    }
+    return v;
+}
+static qos_class_t prio_qos(int prio) {
+    if (!qos_map_on()) return QOS_CLASS_USER_INTERACTIVE;
+    return prio <= g_qos_e1 ? QOS_CLASS_USER_INTERACTIVE : prio <= g_qos_e2 ? QOS_CLASS_USER_INITIATED : QOS_CLASS_UTILITY;
+}
+static void qos_apply(thr_t *t) {   // on the thread itself, holding G
+    qos_class_t q = prio_qos(t->prio);
+    if ((uint32_t)q != t->qos && !pthread_set_qos_class_self_np(q, 0)) t->qos = (uint32_t)q;
+}
 
 static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
 /* TOTK_SVC_STATS=1 (diagnostic, 2026-11-09, default off): what the game's synchronization costs on this runtime - time
@@ -233,6 +271,9 @@ static uint64_t g_core_wait_all_ns, g_core_wait_all_n;   // all guest threads' w
 static int g_cores_on = -1;
 static int cores_enabled(void) { if (g_cores_on < 0) g_cores_on = getenv("TOTK_FREE_CORES") ? 0 : 1; return g_cores_on; }
 static int core_allowed(const thr_t *t, int c) { return (int)((t->mask >> c) & 1); }
+static inline int lock_owner_is(uint32_t owner, const thr_t *o) {
+    return owner && (owner == o->handle || owner == (uint32_t)o->id);   // SDK <=21 stores handle; SDK 22 (OOT) stores kernel thread ID (TLR+0x110)
+}
 #ifdef GAME_BOTW
 /* Priority inheritance (Breath of the Wild, botw.md): a thread that owns a guest mutex runs, for the virtual cores, at
    the priority of the best thread blocked on that mutex, as Horizon raises a mutex owner. The owner is read from the
@@ -271,7 +312,7 @@ static int starved(const thr_t *w, uint64_t now) { sched_knobs(); return g_starv
 static int eff_prio_(const thr_t *o) {
     int p = o->prio;
     for (const thr_t *w = g_wait; w; w = w->next)
-        if (w->wkind == 1 && w->waddr && (__atomic_load_n((const uint32_t *)(uintptr_t)w->waddr, __ATOMIC_RELAXED) & ~WAITERS_BIT) == o->handle && w->prio < p) p = w->prio;
+        if (w->wkind == 1 && w->waddr && lock_owner_is(__atomic_load_n((const uint32_t *)(uintptr_t)w->waddr, __ATOMIC_RELAXED) & ~WAITERS_BIT, o) && w->prio < p) p = w->prio;
     return p;
 }
 static int eff_prio(const thr_t *o) { int p = 0; SCHED_TIMED(3, p = eff_prio_(o)); return p; }
@@ -843,10 +884,12 @@ static void publish_thread_id(uint64_t id) {
 static void *thread_main(void *p) {
     thr_t *t = p;
     pthread_setspecific(g_keythr, t);
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    pthread_mutex_lock(&G);
+    pthread_set_qos_class_self_np(prio_qos(t->prio), 0);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
     t->mport = pthread_mach_thread_np(pthread_self());
+    pthread_mutex_unlock(&G);
 
     guest_thread_init();
     publish_thread_id(t->id);
@@ -898,8 +941,10 @@ uint32_t svc_thread_main_init(void) {
 #endif
     pthread_setspecific(g_keythr, t);
     publish_thread_id(t->id);
+    pthread_set_qos_class_self_np(prio_qos(t->prio), 0);   // fix inherited QOS_CLASS_DEFAULT (0x15) on the main guest thread -> USER_INTERACTIVE (0x21)
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
+    fprintf(stderr, "[threads] main guest thread QoS %#x (priority %d)\n", t->qos, t->prio);
     return t->handle;
 }
 
@@ -1087,7 +1132,13 @@ uint64_t dm_svc_kind_count(int num) { return num >= 0 && num < 64 ? g_svc_kind_n
 uint64_t dm_svc_kind_ns(int num) { return num >= 0 && num < 64 ? g_svc_kind_ns[num] : 0; }   // non-blocked ns inside that SVC
 void dm_sched_stats(uint64_t ns[4], uint64_t n[4]) { for (int i = 0; i < 4; i++) { ns[i] = g_sched_ns[i]; n[i] = g_sched_n[i]; } }   // pick, core_grant, lock_handoff, eff_prio
 static int svc_thread_(int num, uint64_t *regs) {
-    { thr_t *me = (g_keythr ? pthread_getspecific(g_keythr) : NULL); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->last_fp = regs[29]; me->nsvc++; } }
+    thr_t *me = (g_keythr ? pthread_getspecific(g_keythr) : NULL);
+    if (me) {
+        me->last_svc = num; me->last_lr = regs[30]; me->last_fp = regs[29]; me->nsvc++;
+        if (__atomic_load_n(&me->qos_pending, __ATOMIC_RELAXED) && __atomic_exchange_n(&me->qos_pending, 0, __ATOMIC_ACQUIRE)) {
+            pthread_mutex_lock(&G); qos_apply(me); pthread_mutex_unlock(&G);
+        }
+    }
 
     switch (num) {
     case 0x08: {  // CreateThread(→w1 句柄; x1 入口, x2 参数, x3 栈顶, w4 优先级, w5 核) | CreateThread(→w1 handle; x1 entry, x2 argument, x3 stack top, w4 priority, w5 core)
@@ -1158,7 +1209,9 @@ static int svc_thread_(int num, uint64_t *regs) {
         return 1;
     }
     case 0x0C: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)t->prio : 0; pthread_mutex_unlock(&G);return 1; }
-    case 0x0D: { if(regs[1]<28||regs[1]>59){regs[0]=R_BAD_STATE;return 1;}pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD); if (t) t->prio = (int)regs[1]; regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1; }
+    case 0x0D: { if(regs[1]<28||regs[1]>59){regs[0]=R_BAD_STATE;return 1;}pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
+                 if (t) { t->prio = (int)regs[1]; if (qos_map_on()) { if (t == me) qos_apply(t); else __atomic_store_n(&t->qos_pending, 1, __ATOMIC_RELEASE); } }
+                 regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1; }
     case 0x0E: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[2], O_THREAD);
                  regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)(uint32_t)t->core : 0; regs[2] = t ? t->mask : 0;pthread_mutex_unlock(&G); return 1; }
     case 0x0F: {  // SetThreadCoreMask(w0, w1 理想核, x2 掩码)：-1 = 用进程缺省、-2/-3 = 不改理想核；宿主只记账 | SetThreadCoreMask(w0, w1 ideal core, x2 mask): -1 = use the process default, -2/-3 = leave the ideal core unchanged; the host only keeps the bookkeeping
@@ -1185,20 +1238,31 @@ static int svc_thread_(int num, uint64_t *regs) {
 
     case 0x1A: {  // ArbitrateLock(w0 持有者句柄, x1 地址, w2 本线程标签) | ArbitrateLock(w0 owner handle, x1 address, w2 this thread's tag)
         thr_t *t = cur(); uint64_t addr = regs[1];
+        if (lock_fast_on() && !(ld32(addr) & WAITERS_BIT)) { regs[0] = 0; return 1; }   /* no waiter: the SDK already set the tag in user mode */
         pthread_mutex_lock(&G);
 #ifdef GAME_BOTW
         tag_check(t, (uint32_t)regs[2], "ArbitrateLock", addr);
 #endif
-        int64_t r = 0;
-        if (ld32(addr) == ((uint32_t)regs[0] | WAITERS_BIT)) { t->waddr = addr; t->wtag = (uint32_t)regs[2];
-#ifdef GAME_BOTW
-            for (thr_t *o = g_core_wait; o; o = o->cnext) if (o->handle == (uint32_t)regs[0]) { pthread_cond_signal(&o->cv); break; }   // an owner waiting for a core looks again (eff_prio)
-#endif
-            r = block(t, 1, -1); }
+        int64_t r = 0; uint32_t owner_tag = (uint32_t)regs[0];
+        if (ld32(addr) == (owner_tag | WAITERS_BIT)) {
+            t->waddr = addr; t->wtag = (uint32_t)regs[2];
+            for (thr_t *cw = g_core_wait; cw; cw = cw->cnext) if (lock_owner_is(owner_tag, cw)) { pthread_cond_signal(&cw->cv); break; }   // an owner waiting for a core looks again (eff_prio)
+            thr_t *o = qos_map_on() ? h_peek(owner_tag, O_THREAD) : NULL;
+            if (qos_map_on() && !o) for (thr_t *c = g_all; c; c = c->all) if (!c->exited && (uint32_t)c->id == owner_tag) { o = c; break; }
+            pthread_override_t ov = o && o->pt && !o->exited && t->qos > o->qos ? pthread_override_qos_class_start_np(o->pt, (qos_class_t)t->qos, 0) : NULL;
+            r = block(t, 1, -1);
+            if (ov) pthread_override_qos_class_end_np(ov);
+        }
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }
-    case 0x1B: pthread_mutex_lock(&G); lock_handoff(regs[0]); pthread_mutex_unlock(&G); regs[0] = 0; return 1;
+    case 0x1B: {
+        uint64_t addr = regs[0];
+        if (lock_fast_on()) {   /* no waiter: clear the tag it holds, and only if it still holds it */
+            uint32_t v = ld32(addr);
+            if (!(v & WAITERS_BIT) && cas32(addr, &v, 0)) { regs[0] = 0; return 1; }
+        }
+        pthread_mutex_lock(&G); lock_handoff(addr); pthread_mutex_unlock(&G); regs[0] = 0; return 1; }
     case 0x1C: {  // WaitProcessWideKeyAtomic(x0 锁地址, x1 条件键, w2 标签, x3 超时) | WaitProcessWideKeyAtomic(x0 lock address, x1 condition key, w2 tag, x3 timeout)
         thr_t *t = cur(); uint64_t addr = regs[0], key = regs[1];
         pthread_mutex_lock(&G);

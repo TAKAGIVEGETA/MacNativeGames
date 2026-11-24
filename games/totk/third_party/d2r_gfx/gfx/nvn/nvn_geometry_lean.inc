@@ -83,7 +83,7 @@ static int geo_vs_writes(NvShader *vs) {   // a vertex shader that writes memory
     return 0;
 }
 // The lean kernel this draw can take instead of gs (its points, lines or triangles in, one vertex per input vertex out), or nil
-static NvShader *geo_lean_pick(NvProg *pr, NvShader *gs, NvShader *lean, int topology, int instances) {
+static NvShader *geo_lean_pick(__unsafe_unretained NvProg *pr, __unsafe_unretained NvShader *gs, __unsafe_unretained NvShader *lean, int topology, int instances) {
     static int on = -1; if (on < 0) { const char *e = getenv("TOTK_GEO_LEAN"); on = !(e && !strcmp(e, "0")); }
     int width = topology == 0 ? 1 : topology == 1 ? 2 : topology == 3 ? 3 : 0;
     if (!on || !lean || !width || instances != 1 || gs->geo_invocations != 1 || lean->geo_invocations != 1 || lean->geo_vertices != width || !lean->geo_slot ||

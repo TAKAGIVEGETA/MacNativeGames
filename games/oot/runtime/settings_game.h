@@ -113,6 +113,7 @@ static void settings_restore_begin(void) {
  {extern void netbp_set_flag(int);if(!getenv("OOT_NET_BYPASS")&&settings_read_int("graphics-net-bypass.txt",&v)&&(v==0||v==1))netbp_set_flag(v);}
  {extern void runtime_operation_mode_choose(int,int);if(!getenv("TOTK_OPERATION_MODE")&&!(settings_read_int("graphics-profile.txt",&v)&&v==0))runtime_operation_mode_choose(0,0);}   /* no choice saved: the handheld quality profile (user 2026-11-10, after comparing in the panel) */   /* the handheld quality profile, before the guest starts */
  {extern void netbp_copy_set_flag(int);if(!getenv("OOT_NET_COPY")&&settings_read_int("graphics-net-copy.txt",&v)&&(v==0||v==1))netbp_copy_set_flag(v);}
+ {extern void runtime_qo_async_set(int);if(!getenv("OOT_QO_ASYNC")){if(settings_read_int("graphics-async-replay.txt",&v)&&(v==0||v==1))runtime_qo_async_set(v);else runtime_qo_async_set(1);}}   /* replays on the queue-order thread: the frame stops waiting for its own replay (PR #2132, default on) */
  {int c=settings_oot_canvas_saved();   /* no choice saved: 1, 720p native (user 2026-11-10: "默认 用 掌机， 跳过 收尾网络 720原生"; it was 2, 1080p from 720p, since 2026-11-09); 9: no longer listed */
  settingsOotCanvas=c;runtime_oot_canvas_set(c,0);dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1.5*NSEC_PER_SEC)),dispatch_get_main_queue(),^{settings_oot_window_sync();});}
 #endif
@@ -356,6 +357,11 @@ static TOTKSettingRow *settings_oot_profile_row(void) {
  return settings_row(settings_text("画质档位","Quality profile"),@[settings_text("底座","Docked"),settings_text("掌机（植被较少，更快，默认）","Handheld (less vegetation, faster, default)")],@[@0,@1],
   ^int{return !runtime_operation_mode_docked();},^(int v){runtime_operation_mode_choose(!v,1);settings_save_int("graphics-profile.txt",v,"quality profile");});
 }
+extern void runtime_qo_async_set(int on); extern int runtime_qo_async_flag(void);
+static TOTKSettingRow *settings_oot_async_replay_row(void) {
+ return settings_row(settings_text("队列回放线程","Queue replay thread"),@[settings_text("主线程（同步）","Main thread (synchronous)"),settings_text("队列线程（异步，更快，默认）","Queue thread (async, faster, default)")],@[@0,@1],
+  ^int{return runtime_qo_async_flag();},^(int v){runtime_qo_async_set(v);settings_save_int("graphics-async-replay.txt",v,"async queue replay");});
+}
 #endif
 #if defined(GAME_OOT) && !TARGET_OS_IPHONE
 /* The resolution row: the canvas and the 3D picture together, in force at once. */
@@ -449,7 +455,7 @@ static NSArray<TOTKSettingRow *> *settings_rows(void) {
  NSString *resolution=settings_text("分辨率","Resolution");
 #if   defined(GAME_OOT) && !TARGET_OS_IPHONE
  (void)resolution;   /* every resolution setting of this game is on this page (user 2026-11-09) */
- [rows addObject:settings_oot_output_row()];[rows addObject:settings_oot_upscaler_row()];[rows addObject:settings_oot_net_copy_row()];[rows addObject:settings_oot_profile_row()];
+ [rows addObject:settings_oot_output_row()];[rows addObject:settings_oot_upscaler_row()];[rows addObject:settings_oot_net_copy_row()];[rows addObject:settings_oot_profile_row()];[rows addObject:settings_oot_async_replay_row()];
 #else
  if(res.count<2)[rows addObject:settings_fixed(resolution,@"1080p")];
  else [rows addObject:settings_row(resolution,res,resModes,

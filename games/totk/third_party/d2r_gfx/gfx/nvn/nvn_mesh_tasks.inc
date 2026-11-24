@@ -327,13 +327,18 @@ static void mtk_scratch_report(void) {
     MLOG("[mesh] device stage memory F%llu: slots held now %u of %u, counter %u, forced takes %u",(unsigned long long)f,held,g_mtk_scratch_slots,h[0],h[MTK_SCRATCH_FORCED]);
     if(h[MTK_SCRATCH_FORCED]){static int said;if(said++<3)MLOG("【红】[mesh] %u threadgroups took a slot still in use (spin limit): stage memory may have been shared",h[MTK_SCRATCH_FORCED]);}
 }
-static void mtk_encode(id<MTL4RenderCommandEncoder> en) {
-    NvShader *ts=g_mtk.ts,*ms=g_mtk.ms;
+static void mtk_encode(__unsafe_unretained id<MTL4RenderCommandEncoder> en) {
+    __unsafe_unretained NvShader *ts=g_mtk.ts,*ms=g_mtk.ms;
     const int blocks=!ts&&mtk_blocks_on(ms);   // the mesh's own object function launches its workgroups MTK_OBJECT_BLOCK at a time
-    if(rs_using(en))rs_put((nvn_encode_packet){.op=RS_MESH_TABLES,.u={ts||blocks}},0);
-    else {[en setArgumentTable:g_vt atStages:MTLRenderStageMesh];if(ts||blocks)[en setArgumentTable:g_ot atStages:MTLRenderStageObject];}
+    const uint8_t want_tbl = (uint8_t)(1 | ((ts||blocks) ? 2 : 0));
+    es_on(en);
+    if((g_es.mesh_tbl & want_tbl) != want_tbl){
+        if(rs_using(en))rs_put((nvn_encode_packet){.op=RS_MESH_TABLES,.u={ts||blocks}},0);
+        else {if(!(g_es.mesh_tbl&1))[en setArgumentTable:g_vt atStages:MTLRenderStageMesh];if((want_tbl&2)&&!(g_es.mesh_tbl&2))[en setArgumentTable:g_ot atStages:MTLRenderStageObject];}
+        g_es.mesh_tbl |= want_tbl;
+    }
     uint64_t first=g_mtk.first_gpu;
-    if(!first){id<MTLBuffer>b;size_t o=arena_alloc(16,&b);memcpy((uint8_t *)b.contents+o,&g_mtk.first,4);first=b.gpuAddress+o;}
+    if(!first){__unsafe_unretained id<MTLBuffer> b=nil;uint8_t *cpu=NULL;arena_alloc_u(16,&b,&cpu,&first);memcpy(cpu,&g_mtk.first,4);}
     if(ts){g_args_dirty[3]=1;encode_args((id<MTLCommandEncoder>)en,ts,3,0);
         if(rs_using(en))rs_put((nvn_encode_packet){.op=RS_OBJECT_ADDRESS,.u={29,first}},0);else[g_ot setAddress:first atIndex:29];}
     g_args_dirty[4]=1;encode_args((id<MTLCommandEncoder>)en,ms,4,1);enc_r_vbuf(en,29,first);
@@ -345,7 +350,7 @@ static void mtk_encode(id<MTL4RenderCommandEncoder> en) {
            direct draw's copy) and each object threadgroup launches its block. An indirect draw's count is known only on the
            GPU, so it gets MTK_OBJECT_BLOCKS_INDIRECT object threadgroups; the ones past the count launch nothing. */
         uint64_t count=g_mtk.indirect_gpu;uint32_t groups=g_mtk.indirect_gpu?MTK_OBJECT_BLOCKS_INDIRECT:(g_mtk.count+MTK_OBJECT_BLOCK-1)/MTK_OBJECT_BLOCK;
-        if(!count){id<MTLBuffer>b;size_t o=arena_alloc(16,&b);memcpy((uint8_t *)b.contents+o,&g_mtk.count,4);count=b.gpuAddress+o;}
+        if(!count){__unsafe_unretained id<MTLBuffer> b=nil;uint8_t *cpu=NULL;arena_alloc_u(16,&b,&cpu,&count);memcpy(cpu,&g_mtk.count,4);}
         if(rs_using(en))rs_put((nvn_encode_packet){.op=RS_OBJECT_ADDRESS,.u={MTK_OBJECT_COUNT_BUFFER,count}},0);else[g_ot setAddress:count atIndex:MTK_OBJECT_COUNT_BUFFER];
         atomic_fetch_add(&g_mtk_block_draws,1);
         if(groups){

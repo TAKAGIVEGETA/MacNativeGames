@@ -59,8 +59,8 @@ static int mtk_owners(NvShader **ts,NvShader **ms);   // nvn_mesh_tasks.inc (inc
 static int mesh_batch_tex_range(const tex_t *t,uint64_t *lo,uint64_t *n){if(!t||!t->mem||!t->L.size)return 0;*lo=(uintptr_t)t->mem;*n=t->L.size;return 1;}
 static void mesh_batch_whole(uint64_t *why){g_mb_wr_whole++;mesh_batch_write_why(0,UINT64_MAX,NULL,why);}
 /* The writes of one shader stage, by its bindings. st: the NVN stage whose S.ssbo / S.img tables it is bound through. */
-static void mesh_batch_shader_writes(NvShader *sh,int st,uint64_t *why) {
-    if(!sh||!g_mb_n)return;
+static void mesh_batch_shader_writes(__unsafe_unretained NvShader *sh,int st,uint64_t *why) {
+    if(!sh||!g_mb_n||!pool_shader_writes(sh))return;
     for(int i=0;i<sh->rf.nb&&g_mb_n;i++){const nvn_rbind *b=&sh->rf.b[i];
         if(b->kind==NVN_RB_GMEML){mesh_batch_whole(why);return;}   // raw stores through pointers the shader loaded: anywhere
         if(!b->rw)continue;
@@ -100,7 +100,7 @@ static int mesh_batch_eligible(uint64_t source) {
 }
 /* A draw: its render targets and the writes of its stages (the real task / mesh owners too: draw_inner is handed a
    raster-only program for mesh draws, g_mtk holds them, stages 3 and 4). */
-static void mesh_batch_written(NvProg *pr) {
+static void mesh_batch_written(__unsafe_unretained NvProg *pr) {
     if(!g_mb_n)return;
     if(!pr){mesh_batch_whole(&g_mb_inv_written);return;}
     if(R.has_rt){uint64_t lo,n;
@@ -116,7 +116,7 @@ static void mesh_batch_op(unsigned op,const void *a) {
     else if(op==OP_COPY_B2B){g_mb_op_buf++;uint64_t lo,n;memcpy(&lo,(const uint8_t *)a+8,8);memcpy(&n,(const uint8_t *)a+16,8);mesh_batch_write_why(lo,n,NULL,&g_mb_inv_op);}
     else if(op==OP_DISPATCH){g_mb_op_dispatch++;const prog_t *cp=S.cprog?S.cprog:S.prog;   // the compute program's writes, by its bindings (stage 5)
         if(!cp){mesh_batch_whole(&g_mb_inv_op);return;}
-        g_prog_for_draw=1;NvProg *pr=prog_get(cp);g_prog_for_draw=0;
+        g_prog_for_draw=1;__unsafe_unretained NvProg *pr=prog_get(cp);g_prog_for_draw=0;
         if(!pr||pr->missing||!pr->sh[5])mesh_batch_whole(&g_mb_inv_op);else mesh_batch_shader_writes(pr->sh[5],5,&g_mb_inv_op);}
     else if(op==OP_COPY_B2T||op==OP_COPY_T2T||op==OP_CLEAR_TEX){g_mb_op_tex++;const tex_t *t=op==OP_COPY_B2T?((const p_copy_b2t *)a)->tex:op==OP_COPY_T2T?((const p_copy_t2t *)a)->dst:((const p_clear_tex *)a)->tex;uint64_t lo,n;
         if(mesh_batch_tex_range(t,&lo,&n))mesh_batch_write_why(lo,n,NULL,&g_mb_inv_op);else mesh_batch_whole(&g_mb_inv_op);}
