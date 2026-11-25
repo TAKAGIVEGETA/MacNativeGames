@@ -73,7 +73,6 @@ Ocarina of Time, Donkey Kong Bananza and Pokopia package as a Mac app with `buil
 | The Legend of Zelda: Skyward Sword HD | 1.0.1 | Mac | Community port, experimental | [`games/ss`](games/ss/README.md) |
 | Teenage Mutant Ninja Turtles: Shredder's Revenge | 1.0.0 | Mac; iPad target | Community port, experimental; not yet validated as a complete game | [`games/tmnt`](games/tmnt/README.md) |
 | Persona 5 Royal | 1.0.2 | Mac | Early: title, menus and the opening casino at the game's 30 fps, as a Mac app; battles and longer saves not tested | [`games/p5r`](games/p5r/README.md) |
-| Red Dead Redemption | 1.0.4 | Mac; the iPhone / iPad app builds, not run on a device | Bring-up: plays to Armadillo Station at 30 fps; glass and some distant objects draw wrongly; no Mac app yet | [`games/rdr`](games/rdr/README.md) |
 | The Witcher 3: Wild Hunt | 4.04b | Mac | Bring-up: the first in-engine scene, and gameplay at Kaer Morhen from a save, at 30 fps; no Mac app yet | [`games/w3`](games/w3/README.md) |
 | 明星三缺一 2013 | v0 | Mac | Early: title, menus and a game of mahjong against the AI at 30 fps, as a Mac app | [`games/mj2013`](games/mj2013/README.md) |
 
@@ -151,7 +150,7 @@ It is **on by default**. To turn it off: on a Mac, **MNG Launcher › Settings�
 - **2026-11-23: Donkey Kong Bananza builds from a `.nup` or a dump folder, with its add-on content (Mac).** Emerald Rush loads from your own files; it has not been played through.
 - **2026-11-23: Pokémon Pokopia's picture is no longer too dark (Mac).**
 - **2026-11-23: Persona 5 Royal 1.0.2 and The Witcher 3 4.04b on Mac, early.** Persona 5 Royal reaches the opening casino as a Mac app ([games/p5r](games/p5r/README.md)); The Witcher 3 plays at Kaer Morhen from a save, without an app yet ([games/w3](games/w3/README.md)).
-- **2026-11-22: Red Dead Redemption 1.0.4 and 明星三缺一 2013 on Mac, early.** Red Dead Redemption plays to Armadillo Station, without an app yet ([games/rdr](games/rdr/README.md)); 明星三缺一 plays a game of mahjong as a Mac app ([games/mj2013](games/mj2013/README.md)).
+- **2026-11-22: 明星三缺一 2013 on Mac, early.** It plays a game of mahjong as a Mac app ([games/mj2013](games/mj2013/README.md)).
 - **2026-11-22: Age of Calamity and Mario Kart 8 Deluxe have rewrites on the Zelda runtime, without an app yet** ([games/aocx](games/aocx/README.md), [games/mk8dx](games/mk8dx/README.md)).
 - **2026-11-22: Breath of the Wild's Game Over title and cutscene name cards no longer show the wrong characters.**
 - **2026-11-14: WORLDEND SYNDROME 1.0.0 on Mac, experimental.** Built from your own base files; title through ADV, saves and the first loop were played ([games/worldend](games/worldend/README.md)).
@@ -215,6 +214,7 @@ Measuring by game state with the Metal performance tools of macOS 27 (`TOTK_STAT
 - **[x86recomp](https://github.com/JTM-rootstorm/x86recomp)** (MIT) is the recompiler and Win32 runtime of the Windows games (`windows_games/ra2/third_party/x86recomp`, with our changes); it builds on **Berkeley SoftFloat 3** (BSD-3-Clause) and **CORE-MATH** (MIT), and on iOS on **SDL3** (zlib), **glslang**, **SPIRV-Cross** and a decoders-only **ffmpeg** (LGPL). Its Simplified Chinese is converted with **[OpenCC](https://github.com/BYVoid/OpenCC)** (Apache-2.0), the added glyphs drawn from **[Noto Sans CJK](https://github.com/notofonts/noto-cjk)** (Source Han Sans, SIL OFL 1.1).
 - **[BasaltVR](https://github.com/frenchbaguetteman/BasaltVR)** (MIT) streams the VR picture: `zeldaVR/install_vr.sh` fetches it at a pinned commit and applies our changes (`zeldaVR/streamer/basaltvr.patch`). On the headset, the **[ALVR](https://github.com/alvr-org/ALVR)** client (MIT) shows it; it is downloaded from ALVR's releases and checked by its SHA-256. **[BotW-BetterVR](https://github.com/Crementif/BotW-BetterVR)** (MIT), UEVR and R.E.A.L. were references for the camera, first person and motion controls; no code is copied.
 - **Ocarina of Time** (`games/oot`; every source is listed in [its COPIES.md](games/oot/third_party/COPIES.md)): the NUP reader is **[nup](https://github.com/a55uka/nup)** (MIT); the AV1 movie decoder is adapted from **nxnative**, and the mesh and task shader stages, the HMMA matrix lowering and the typed pool arrays from **[ChiefSZ13/nxnative](https://github.com/ChiefSZ13/nxnative)** (MIT); **dav1d** (BSD-2-Clause) is bundled as the AV1 fallback; **zbic** (GPLv2) is run as a separate build tool, never copied or shipped. NVIDIA's CUDA Binary Utilities and PTX documents and Mesa's NAK were references for Ampere instruction semantics, and **[Lichii](https://github.com/zortos293/Lichii)** (GPL-3.0) for field meanings only; no code from it is copied.
+- **[Savage Wind Recomp](https://github.com/Revivedx/SavageWindRecomp)** (MIT), a static recompilation of Breath of the Wild 1.9.0, is the reference for fixes to 1.9.0's game logic above 30 fps (sites, causes and formulas); no code is copied.
 - Community ports that carry code from elsewhere list it in their own folder (`third_party/COPIES.md`). The main project's and the Windows games' copied code, with each license, is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## License
@@ -292,7 +292,6 @@ Switch 2 游戏在《王国之泪》同一套运行时上运行：它们的 Ampe
 | 塞尔达传说 御天之剑 HD | 1.0.1 | Mac | 社区移植，实验性 | [`games/ss`](games/ss/README.md) |
 | 忍者神龟：施莱德的复仇 | 1.0.0 | Mac；有 iPad 目标 | 社区移植，实验性；还没有作为完整游戏验证过 | [`games/tmnt`](games/tmnt/README.md) |
 | 女神异闻录 5 皇家版 | 1.0.2 | Mac | 早期：标题、菜单和开场赌场，游戏原本的 30 帧，有 Mac App；战斗和长时间存读档没测 | [`games/p5r`](games/p5r/README.md) |
-| 荒野大镖客：救赎 | 1.0.4 | Mac；iPhone / iPad App 能编译，没在设备上跑过 | 开发中：能玩到犰狳镇车站，30 帧；玻璃和部分远景画错；还没有 Mac App | [`games/rdr`](games/rdr/README.md) |
 | 巫师 3：狂猎 | 4.04b | Mac | 开发中：第一个引擎内场景，以及读档后在凯尔莫罕游玩，30 帧；还没有 Mac App | [`games/w3`](games/w3/README.md) |
 | 明星三缺一 2013 | v0 | Mac | 早期：标题、菜单和一局对电脑的麻将，30 帧，有 Mac App | [`games/mj2013`](games/mj2013/README.md) |
 
@@ -363,7 +362,7 @@ MNG Launcher 和每个游戏**每天最多上报一次**到 [mac-native-games.co
 - **2026-11-23：大金刚 Bananza 可以用 `.nup` 或导出目录打包，带追加内容（Mac）。** Emerald Rush 能从你自己的文件加载，还没有玩通。
 - **2026-11-23：修复宝可梦 Pokopia 画面偏暗（Mac）。**
 - **2026-11-23：女神异闻录 5 皇家版 1.0.2 和巫师 3 4.04b 登陆 Mac，早期。** 女神异闻录 5 皇家版有 Mac App，能玩到开场赌场（[games/p5r](games/p5r/README.md)）；巫师 3 能读档在凯尔莫罕游玩，还没有 App（[games/w3](games/w3/README.md)）。
-- **2026-11-22：荒野大镖客：救赎 1.0.4 和明星三缺一 2013 登陆 Mac，早期。** 荒野大镖客能玩到犰狳镇车站，还没有 App（[games/rdr](games/rdr/README.md)）；明星三缺一有 Mac App，能打一局麻将（[games/mj2013](games/mj2013/README.md)）。
+- **2026-11-22：明星三缺一 2013 登陆 Mac，早期。** 有 Mac App，能打一局麻将（[games/mj2013](games/mj2013/README.md)）。
 - **2026-11-22：灾厄启示录和马力欧卡丁车 8 豪华版有了塞尔达运行时上的重写版，还没有 App**（[games/aocx](games/aocx/README.md)、[games/mk8dx](games/mk8dx/README.md)）。
 - **2026-11-22：修复旷野之息“游戏结束”字样和过场人名卡显示成别的字。**
 - **2026-11-14：WORLDEND SYNDROME 1.0.0 登陆 Mac，实验性。** 用你自己的本体文件打包；从标题玩过 ADV、存档和第一周目循环（[games/worldend](games/worldend/README.md)）。
@@ -422,6 +421,7 @@ MNG Launcher 和每个游戏**每天最多上报一次**到 [mac-native-games.co
 - **[x86recomp](https://github.com/JTM-rootstorm/x86recomp)**（MIT）是 Windows 游戏的重编译器和 Win32 运行时（`windows_games/ra2/third_party/x86recomp`，含我们的改动）；它用到 **Berkeley SoftFloat 3**（BSD-3-Clause）和 **CORE-MATH**（MIT），iOS 上还用到 **SDL3**（zlib）、**glslang**、**SPIRV-Cross** 和只带解码器的 **ffmpeg**（LGPL）。简体中文用 **[OpenCC](https://github.com/BYVoid/OpenCC)**（Apache-2.0）转换，补的字形取自 **[思源黑体 / Noto Sans CJK](https://github.com/notofonts/noto-cjk)**（SIL OFL 1.1）。
 - **[BasaltVR](https://github.com/frenchbaguetteman/BasaltVR)**（MIT）负责串流 VR 画面：`zeldaVR/install_vr.sh` 按固定提交取得它，再打上我们的改动（`zeldaVR/streamer/basaltvr.patch`）。头显上显示画面的是 **[ALVR](https://github.com/alvr-org/ALVR)** 客户端（MIT），从 ALVR 的发布页下载并核对 SHA-256。**[BotW-BetterVR](https://github.com/Crementif/BotW-BetterVR)**（MIT）、UEVR 和 R.E.A.L. 是镜头、第一人称和体感操作的参考，没有拷代码。
 - **时之笛**（`games/oot`，全部来源列在[它的 COPIES.md](games/oot/third_party/COPIES.md)）：NUP 读取用 **[nup](https://github.com/a55uka/nup)**（MIT）；AV1 影片解码改编自 **nxnative**，网格 / 任务着色器阶段、HMMA 矩阵运算的翻译和按类型的池数组改编自 **[ChiefSZ13/nxnative](https://github.com/ChiefSZ13/nxnative)**（MIT）；**dav1d**（BSD-2-Clause）随 App 带着，作 AV1 的后备解码；**zbic**（GPLv2）只作为独立的打包工具运行，不拷贝、不随 App 发布。Ampere 指令语义参考了 NVIDIA 的 CUDA Binary Utilities、PTX 文档和 Mesa 的 NAK，**[Lichii](https://github.com/zortos293/Lichii)**（GPL-3.0）只参考了字段含义，没有拷它的代码。
+- **[Savage Wind Recomp](https://github.com/Revivedx/SavageWindRecomp)**（MIT）是《旷野之息》1.9.0 的静态重编译，是修正 1.9.0 游戏逻辑在 30 帧以上问题的参考（位置、原因和公式），没有拷代码。
 - 带了别处代码的社区移植，在各自目录的 `third_party/COPIES.md` 里列出。主项目和 Windows 游戏拷进来的代码及各自的许可，列在 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 许可证

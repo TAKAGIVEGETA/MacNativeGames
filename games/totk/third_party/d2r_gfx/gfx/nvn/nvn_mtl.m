@@ -466,7 +466,11 @@ static NSHashTable *g_res_objects;
    all show ~15 GB of wired memory on the 16 GB machine with totk-native on the Metal submission queue: the driver ran out
    of memory wiring what this residency set made resident. Live resident bytes are attributed to the res_add source line
    so unbounded growth can be located, and gpu_budget_check refuses to go on past a budget instead of handing it to the driver. */
-#define RES_SITES 8192
+/* unused: tests/test_residency_registration.py builds the lines around here alone, without their readers */
+__attribute__((unused)) static _Atomic uint64_t g_texels_gpu_reads,g_texels_gpu_writes,g_texels_gpu_bytes,g_texels_gpu_failures;   // texels_gpu_region, far below
+/* unused: as the texel counters below, tests/test_residency_registration.py builds these lines without their readers */
+__attribute__((unused)) static _Atomic int g_cam_poke_count = 1; __attribute__((unused)) static _Atomic int g_cam_poke_off, g_cam_poke_pct = 100, g_cam_poke_match, g_cam_poke_off2 = -1, g_cam_poke_stage = -1, g_cam_poke_size; __attribute__((unused)) static _Atomic uint64_t g_cam_poke_n;   // encode_args, far below (diagnostic)
+#define RES_SITES 32768   /* nvn_mtl.m has more than 26,000 lines: at 8192 most registrations were counted under site 0 (2026-11-24) */
 static struct { uint64_t adds, removes, live_bytes; _Atomic uint64_t alive, alive_bytes; } g_res_site[RES_SITES];   // alive*: objects not yet deallocated (whether or not still resident)
 /* Deallocation probe: an associated object whose dealloc runs when the Metal object itself is freed, so "removed from the
    residency set but still alive" (retained elsewhere) can be told apart from "freed". */
@@ -587,6 +591,16 @@ static void res_site_report(int top) {
     for (int i = 0; i < RES_SITES; i++) if (g_res_site[i].adds) order[n++] = i;
     for (int i = 1; i < n; i++) { int k = order[i], j = i; while (j > 0 && atomic_load(&g_res_site[order[j - 1]].alive_bytes) < atomic_load(&g_res_site[k].alive_bytes)) { order[j] = order[j - 1]; j--; } order[j] = k; }
     MLOG("驻留集明细：%lu 个对象，按登记时大小合计 %llu MB，显卡已分配 %llu MB（按 nvn_mtl.m 登记行，存活字节降序）", nobj, (unsigned long long)(total >> 20), (unsigned long long)(g_dev.currentAllocatedSize >> 20));
+    {   /* command memory: Metal 4 allocators keep what their largest command buffer needed until they are released; none of
+           it is in the residency set, so the breakdown above does not show it (2026-11-24) */
+        uint64_t am = 0, au = 0, ap = 0; int nm = g_alloc_n, nu = g_up_alloc_n;
+        for (int i = 0; i < nm && i < ALLOC_MAX; i++) am += (uint64_t)[g_alloc4[i] allocatedSize];
+        for (int i = 0; i < nu && i < UP_ALLOC_MAX; i++) au += (uint64_t)[g_up_alloc4[i] allocatedSize];
+        for (int i = 0; i < 3; i++) ap += (uint64_t)[g_present_alloc4[i] allocatedSize];
+        MLOG("  texel regions converted on the GPU so far (ReadTexels / WriteTexels of a level of 1 MiB or more): %llu reads, %llu writes, %llu bytes, %llu failures",
+             (unsigned long long)atomic_load(&g_texels_gpu_reads), (unsigned long long)atomic_load(&g_texels_gpu_writes), (unsigned long long)atomic_load(&g_texels_gpu_bytes), (unsigned long long)atomic_load(&g_texels_gpu_failures));
+        MLOG("  命令分配器：主提交 %d 个 %llu MB，上传 %d 个 %llu MB，出图 3 个 %llu MB（不在驻留集里）", nm, (unsigned long long)(am >> 20), nu, (unsigned long long)(au >> 20), (unsigned long long)(ap >> 20));
+    }
     for (int i = 0; i < n && i < top; i++) {
         int k = order[i];
         MLOG("  行 %d：驻留 %llu 个 %llu MB（登记 %llu 次，撤销 %llu 次）；对象未释放 %llu 个 %llu MB", k, (unsigned long long)(g_res_site[k].adds - g_res_site[k].removes), (unsigned long long)(g_res_site[k].live_bytes >> 20),
@@ -1307,6 +1321,11 @@ static const char *memory_inventory_path(void) {
 static void pool_res(pidx_ent *p, int origin) {   // caller holds g_mu; first cause: 1 binding, 2 CPU range query, 3 raw table
     if (p->res) return;
     if (memory_inventory_path()) objc_setAssociatedObject((__bridge id)p->buf, &g_pool_origin_key, @(origin), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (memory_inventory_path() && p->hi - p->lo >= (64u << 20)) {   // TOTK_MEMORY_INVENTORY: who first makes a large pool resident
+        void *bt[24]; int n = backtrace(bt, 24); char **sy = backtrace_symbols(bt, n); char line[2400]; int o = 0;
+        for (int i = 1; i < n && o < 2200; i++) { const char *q = sy ? sy[i] : "?"; const char *nm = strstr(q, "0x"); nm = nm ? strchr(nm, ' ') : NULL; o += snprintf(line + o, sizeof line - o, " <-%s", nm ? nm : q); }
+        MLOG("[pool-resident] %llu MB pool %#llx made resident (origin %d) by:%s", (unsigned long long)((p->hi - p->lo) >> 20), (unsigned long long)p->lo, origin, line); free(sy);
+    }
     res_add((__bridge id<MTLBuffer>)p->buf); res_commit();
     p->res = 1; g_pool_res_n++; g_pool_res_bytes += p->hi - p->lo;
 }
@@ -1441,6 +1460,18 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     if (!pool_lookup(addr, len, buf, &base, &gpu)) return 0;
     *off = addr - base;
     return 1;
+}
+/* Which pool allocation holds [addr, addr+len) and where in it, for a caller that only names the storage (a key, a log
+   line) and reads nothing through the GPU. Unlike mtl_addr it does not make the pool resident: the VR projection graph
+   keyed its images this way and so pinned every pool a render target or sampled texture lay in (2026-11-24, Ocarina of
+   Time, Quest 3 on a 16 GB Mac: 41 pools, 3,889 MB resident from the first frames in the world, one of them 2,432 MB,
+   against 15 pools / 36 MB without VR; a GPU out-of-memory error followed at a larger eye size). */
+static int mtl_addr_identity(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
+    pthread_mutex_lock(&g_mu);
+    pidx_ent *p = pool_query((uintptr_t)addr, len);
+    if (p) { *buf = p->buf; *off = addr - p->base; }
+    pthread_mutex_unlock(&g_mu);
+    return p != NULL;
 }
 int mtl_gpu_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off, uint64_t *gpu) {
     uint64_t base, pgpu;
@@ -1737,6 +1768,15 @@ static NSMutableArray<NSNumber *> *g_vr_native_slots;
 static int race_on(void); static void race_note(uint64_t addr, uint64_t size, const char *key, char kind); static void race_commit_mark(void);   // OOT_RACE_CHECK (below)
 static int rdf_on(void); static void gpu_read_input(uint64_t addr, uint64_t size, const char *key, char kind); static void rdf_drain_log(void); static void noread_drain_log(void);   // OOT_GPU_READ_FENCE / OOT_NOREAD_PROBE (below)
 static uint64_t g_alloc_fence[ALLOC_MAX]; static uint64_t g_alloc_waits, g_alloc_grown;
+/* An allocator keeps the command memory of its largest submission until it is released, and the pool only grew: one burst
+   with many submissions in flight (a load, the first seconds of VR) left its allocators for the whole session
+   (2026-11-24, Ocarina of Time in VR at 2048x2208: 19 allocators, 285 MB, none of it in the residency set). The search
+   below takes the lowest finished one, so the highest are the ones a calmer game no longer reaches: the last allocator
+   is released once the GPU has finished with it and it has not been taken for ALLOC_IDLE_SUBS submissions. Three stay.
+   TOTK_ALLOC_TRIM=0 keeps every allocator as before. */
+#define ALLOC_IDLE_SUBS 4000
+static uint64_t g_alloc_used[ALLOC_MAX], g_alloc_subs, g_alloc_trimmed;
+static int alloc_trim_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_ALLOC_TRIM"); v = !(e && !atoi(e)); } return v; }
 int mtl_wait(uint64_t fence, uint64_t timeout_ns);
 static void up_flush(void);
 // 上传批只属于提交线程（发起 mtl_sub_begin 的线程）：批的编码器不能跨线程用。每个入口断言当前线程 == 提交线程，
@@ -1815,12 +1855,17 @@ void mtl_sub_begin(void) {
     // Do not wait for the GPU mid-frame (hot real device: with a fixed rotation of 3, when the GPU cannot keep up every frame blocks here, and the submit thread runs at low frequency after waking, instruction count −18% but CPU time +49%):
     // pick an allocator the GPU has finished with; if all are in use create a new one; only at the cap wait for the oldest one. How far ahead it runs is bounded by the wait where the game acquires the swapchain texture, same as the old interface.
     int alloc_i = -1; uint64_t done = g_done;
+    g_alloc_subs++;
+    while (g_alloc_n > 3 && alloc_trim_on() && g_alloc_fence[g_alloc_n - 1] <= done && g_alloc_subs - g_alloc_used[g_alloc_n - 1] > ALLOC_IDLE_SUBS) {
+        g_alloc4[--g_alloc_n] = nil; g_alloc_fence[g_alloc_n] = 0; g_alloc_trimmed++;
+        if (g_alloc_trimmed <= 3 || !(g_alloc_trimmed & (g_alloc_trimmed - 1))) MLOG("[alloc] released an idle command allocator (%llu so far); %d kept", (unsigned long long)g_alloc_trimmed, g_alloc_n);
+    }
     for (int i = 0; i < g_alloc_n; i++) if (g_alloc_fence[i] <= done) { alloc_i = i; break; }
     if (alloc_i < 0 && g_alloc_n < ALLOC_MAX) { NSError *ae = nil; MTL4CommandAllocatorDescriptor *ad = [MTL4CommandAllocatorDescriptor new];
         g_alloc4[g_alloc_n] = [g_dev newCommandAllocatorWithDescriptor:ad error:&ae]; if (!g_alloc4[g_alloc_n]) MDIE("新建 MTL4CommandAllocator 失败：%s", ae.localizedDescription.UTF8String);
         alloc_i = g_alloc_n++; g_alloc_grown++; }
     if (alloc_i < 0) { alloc_i = 0; for (int i = 1; i < g_alloc_n; i++) if (g_alloc_fence[i] < g_alloc_fence[alloc_i]) alloc_i = i; g_alloc_waits++; mtl_wait(g_alloc_fence[alloc_i], UINT64_MAX); }
-    g_alloc_cur = alloc_i;
+    g_alloc_cur = alloc_i; g_alloc_used[alloc_i] = g_alloc_subs;
     [g_alloc4[alloc_i] reset];
     [g_cb beginCommandBufferWithAllocator:g_alloc4[alloc_i]];
     g_commit_blocks = [NSMutableArray array];
@@ -4062,7 +4107,7 @@ static int pkg_final_cache_on(void) {
     if (v < 0) { const char *e = getenv("TOTK_PKG_FINAL_CACHE"); v = !(e && !atoi(e)); atomic_store(&g_pkg_final_cache, v); }
     return v;
 }
-@interface NvPkg : NSObject { @public id<MTLTexture> tex; NSMutableDictionary *views; __unsafe_unretained id<MTLTexture> view_base; uint64_t stamp, seen, hash, owned_gen; int tracked, owned, hashed, vol, lost, keep_full; reup_key key; uint64_t chash, csub, used; uintptr_t lo, hi; uint8_t *edge; uint32_t eh, et; int edge_want; BOTW_PKG_FIELDS UI_PACK_PKG_FIELDS } @end   // lo / hi (TOTK): the texture's memory (pkg_orphan_report)   // tracked (TOTK): result of the last nvn_dirty_tracked   // hash：DM_NVN_DIRTYCHECK 时上传内容的全量哈希 | hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK
+@interface NvPkg : NSObject { @public id<MTLTexture> tex; NSMutableDictionary *views; __unsafe_unretained id<MTLTexture> view_base; uint64_t stamp, seen, hash, owned_gen; int tracked, owned, hashed, vol, lost, keep_full; reup_key key; uint64_t chash, csub, used; uintptr_t lo, hi; uint8_t *edge; uint32_t eh, et; int edge_want; uint8_t restores; uint64_t last_use; BOTW_PKG_FIELDS UI_PACK_PKG_FIELDS } @end   // lo / hi (TOTK): the texture's memory (pkg_orphan_report)   // tracked (TOTK): result of the last nvn_dirty_tracked   // hash：DM_NVN_DIRTYCHECK 时上传内容的全量哈希 | hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK
 static void pkg_views_drop(NvPkg *pkg) {
     if (pkg->views) defer_obj_unref(pkg->views);
     pkg->views = nil; pkg->view_base = nil;
@@ -4272,6 +4317,13 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name,"raw_write_log")) { atomic_store(&g_raw_write_log,v!=0); MLOG("[flag] raw_write_log = %d",v!=0); return; }
     if (!strcmp(name,"raw_write_capture")) { atomic_store(&g_raw_write_capture,MAX(0,MIN(v,16))); MLOG("[flag] raw_write_capture = %d",atomic_load(&g_raw_write_capture)); return; }
     if (!strcmp(name,"writer_boundary")) { atomic_store(&g_writer_boundary,v!=0&&!TARGET_OS_IPHONE); MLOG("[flag] writer_boundary = %d seals=%llu waits=%llu wait-ms=%.3f",writer_boundary_on(),(unsigned long long)g_writer_seals,(unsigned long long)g_writer_waits,(double)g_writer_wait_ns/1e6);return; }
+    if (!strcmp(name,"cam_poke_match")) { atomic_store(&g_cam_poke_match, v); atomic_store(&g_cam_poke_n, 0); MLOG("[flag] cam_poke_match = %d thousandths", v); return; }
+    if (!strcmp(name,"cam_poke_count")) { atomic_store(&g_cam_poke_count, v > 0 ? v : 1); return; }
+    if (!strcmp(name,"cam_poke_off2")) { atomic_store(&g_cam_poke_off2, v); return; }
+    if (!strcmp(name,"cam_poke_stage")) { atomic_store(&g_cam_poke_stage, v); return; }
+    if (!strcmp(name,"cam_poke_size")) { atomic_store(&g_cam_poke_size, v); return; }
+    if (!strcmp(name,"cam_poke_off")) { atomic_store(&g_cam_poke_off, v); MLOG("[flag] cam_poke_off = %#x", v); return; }
+    if (!strcmp(name,"cam_poke_pct")) { atomic_store(&g_cam_poke_pct, v > 0 ? v : 100); MLOG("[flag] cam_poke_pct = %d (view block copies made so far %llu)", v, (unsigned long long)atomic_load(&g_cam_poke_n)); return; }
     if (!strcmp(name,"rs_spin_us")) { atomic_store(&g_rs_spin_flag,(uint64_t)MAX(0,v)*1000ull); MLOG("[flag] rs_spin_us = %d (0 = default): the encode stage's wait on an empty queue before it sleeps",v); return; }
     if (!strcmp(name,"raw_index")) { atomic_store(&g_raw_index,v!=0); MLOG("[flag] raw_index = %d",v!=0); return; }
     if (!strcmp(name,"raw_range_cache")) { atomic_store(&g_raw_range_cache,v!=0); MLOG("[flag] raw_range_cache = %d",v!=0); return; }
@@ -4321,6 +4373,11 @@ void dm_gfx_set_flag(const char *name, int v) {
         MLOG("[flag] diagnostic skipfs %.16s = %d (incomplete geometry; invalid FPS)", p, v != 0); return;
     }
     if (!strcmp(name, "fxaa_off")) { extern void dm_gfx_fxaa_set(int on); dm_gfx_fxaa_set(!v); return; }   // totk_finish.h
+    // The effects page's anti-aliasing rows for an in-session A/B (totk_aa_config.h; not saved): 0 off, 1 FXAA, 2 SMAA;
+    // SMAA 0 Low .. 3 Ultra; FXAA 0 Original, 1 Quality. A value out of range is ignored.
+    if (!strcmp(name, "aa_method")) { extern void dm_gfx_aa_method_set(int m); dm_gfx_aa_method_set(v); return; }
+    if (!strcmp(name, "smaa_quality")) { extern void dm_gfx_smaa_quality_set(int q); dm_gfx_smaa_quality_set(v); MLOG("[flag] smaa_quality = %d", v); return; }
+    if (!strcmp(name, "fxaa_quality")) { extern void dm_gfx_fxaa_quality_set(int q); dm_gfx_fxaa_quality_set(v); MLOG("[flag] fxaa_quality = %d", v); return; }
     if (!strcmp(name, "sharpen_pct")) { extern void dm_gfx_sharpen_set(int pct); dm_gfx_sharpen_set(v); return; }
     if (!strncmp(name, "fx_", 3)) {   // "flag fx_<id> <0|1>": an effect switch (totk_fx.h), 0 = off
         extern int dm_gfx_fx_count(void); extern const char *dm_gfx_fx_id(int i); extern void dm_gfx_fx_set(int i, int on);
@@ -5642,6 +5699,7 @@ static int pkg_edge_clean(const tex_t *t, NvPkg *pk) {   // 1: only the shared p
 }
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, reup_key *key, NvPkg *pk);
 static uint64_t g_pkg_upload_faults, g_pkg_upload_unreadable;
+static uint64_t g_pkg_gap[8], g_pkg_gap_r[8], g_pkg_gap_bytes;   // copies uploaded again after a drop: by submissions since their last use (<6,000, <12,000, ... doubling), by how often before, guest bytes
 /* 1 when every page of [mem, mem+size) can be read now: one byte per host page (and the last byte) is read under the
    fault guard. A walk with mach_vm_region was one system call per VM entry, and the dirty tracker splits a texture's
    range into an entry per page it unprotected: ~1 ms for a 16 MiB texture in alternating protections, ~16 us this way.
@@ -6120,7 +6178,8 @@ static void *tex_mtl_p(const tex_t *ct) {
             uint64_t now = nvn_dirty_now(), h = 0; int clean;
             const int lv_reduced = pk->tex && pk->tex.mipmapLevelCount < (t->d.levels ? t->d.levels : 1u);
             if (!pk->tex || (pk->owned && reduced) || (pk->keep_full && lv_reduced)) {   // keep_full: read by integer texel coordinates (tex_keep_full)   // TOTK: the copy was evicted, or the GPU renders into a reduced copy (needs full size); the copy was evicted under memory pressure (pkg_evict_sweep): upload it again from the pool bytes
-                clean = 0; g_pkg_restored++;
+                clean = 0; g_pkg_restored++; if (!pk->tex && pk->last_use) { uint64_t gap = g_sub_serial - pk->last_use; int b = 0; while (b < 7 && gap >= (UINT64_C(6000) << b)) b++; g_pkg_gap[b]++; g_pkg_gap_r[MIN(pk->restores, 7)]++; g_pkg_gap_bytes += t->L.size; }
+                if (!pk->tex && pk->restores < 255) pk->restores++;   // dropped and wanted again (pkg_evict_sweep keeps it longer)
                 if (pk->hashed) { pk->csub = g_sub_serial; if (!pkg_hash_guarded(t, &h)) h = 0; }   // a fault: the upload below refuses too
             } else
             if (pk->hashed) {   // TOTK: small texture, content hash once per submission (see pkg_hashed)
@@ -7064,7 +7123,7 @@ static vr_projection_image vr_native_image(const tex_t *t,const view_t *v,int ha
     uint64_t delta=nvn_tex_level_offset(&t->d,level)+slice*t->L.layer_size;
     if(delta>=t->L.size)return (vr_projection_image){0};
     void *allocation=NULL;uint64_t offset=0;
-    if(!mtl_addr((uint64_t)(uintptr_t)t->mem+delta,1,&allocation,&offset))return (vr_projection_image){0};
+    if(!mtl_addr_identity((uint64_t)(uintptr_t)t->mem+delta,1,&allocation,&offset))return (vr_projection_image){0};   // a key only: not made resident
     return (vr_projection_image){(__bridge id)allocation,offset,MAX(t->d.width>>level,1u),MAX(t->d.height>>level,1u)};
 }
 static int vr_projection_tracking(void){return vr_labo_active()||vr_wants_camera();}
@@ -9123,6 +9182,7 @@ static void pkg_purge_idle(void) {
         MLOG("贴图副本可清除：累计标记 %llu 张 / %llu MB，用到时改回 %llu 张，其中被系统回收、重传 %llu 张",
              (unsigned long long)g_purge_marked, (unsigned long long)g_purge_marked_mb, (unsigned long long)(g_purge_kept + g_purge_taken), (unsigned long long)g_purge_taken); }
 }
+static int evict_backoff_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_TEX_EVICT_BACKOFF"); v = e && atoi(e) != 0; } return v; }
 static void pkg_evict_sweep(void) {
     pkg_purge_idle();
     static int mode = -1; static uint64_t budget, low, high, crit, idle_age;
@@ -9168,13 +9228,34 @@ static void pkg_evict_sweep(void) {
     size_t n = 0, cap = 0; evict_cand *c = NULL; uint64_t total = 0, total_n = 0;
     NSUInteger fmt_pf[16]; uint64_t fmt_b[16], fmt_n[16]; int nfmt = 0;   // copies by Metal pixel format (log)
     uint64_t idle = mode == 3 ? idle_age : mode == 1 && avail < crit ? EVICT_IDLE_CRIT : EVICT_IDLE;
+    /* Two measured alternatives to the plain count, both off by default (2026-11-24, Ocarina of Time on the Mac, flat, the
+       town at the save, standing still, about 2,700 submissions a second, figures at frame ~28,000):
+         count 6,000 (2.2 s)                     copies 681-721 MB, 15,737-16,346 dropped, 10,893-11,367 uploaded again
+         TOTK_TEX_EVICT_SECONDS=10 (27,000)      copies 838 MB,     12,402 dropped,         7,953 uploaded again
+         count + TOTK_TEX_EVICT_BACKOFF=1        copies 882 MB,     11,842 dropped,         7,527 uploaded again
+         both                                    copies 1,196 MB,    9,813 dropped,         6,338 uploaded again
+       The [copy-restore] line says why neither ends it: of 11,371 copies uploaded again, half had been away for more
+       than 96,000 submissions (35 s) and a quarter for more than 192,000 (70 s). The game comes back to them on long
+       cycles, so an age that keeps them is an age that keeps nearly everything (2,461 MB without eviction, above).
+       About 0.36 uploads and 0.1 MB a frame is what the 1.6 GB costs; the frame rate was the same in all four.
+       TOTK_TEX_EVICT_SECONDS=<s>: the age is at least s seconds of submissions at the rate of the last two seconds. */
+    if (mode == 3) {
+        static double secs = -1; static uint64_t t0, s0, by_time;
+        if (secs < 0) { const char *e = getenv("TOTK_TEX_EVICT_SECONDS"); secs = e && *e ? atof(e) : 0; if (secs < 0) secs = 0; }
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (!t0) { t0 = now; s0 = g_sub_serial; }
+        else if (now - t0 >= 2000000000ull) { by_time = (uint64_t)((double)(g_sub_serial - s0) * 1e9 / (double)(now - t0) * secs); t0 = now; s0 = g_sub_serial; }
+        if (secs > 0 && by_time > idle) idle = by_time;
+    }
     for (uint32_t i = 0; i < g_by_serial.cap; i++) {
         __unsafe_unretained id o = (__bridge id)g_by_serial.vals[i];
         if (!o || ![o isKindOfClass:[NvPkg class]]) continue;
         NvPkg *pk = (NvPkg *)o; if (!pk->tex || pk->owned || pk->hashed) continue;
         uint64_t bytes = pk->tex.allocatedSize; total += bytes; total_n++;
         { NSUInteger pf = pk->tex.pixelFormat; int j = 0; for (; j < nfmt && fmt_pf[j] != pf; j++) {} if (j == nfmt && nfmt < 16) { fmt_pf[nfmt] = pf; fmt_b[nfmt] = 0; fmt_n[nfmt++] = 0; } if (j < 16) { fmt_b[j] += bytes; fmt_n[j]++; } }
-        if (pk->used + idle > g_sub_serial) continue;
+        /* TOTK_TEX_EVICT_BACKOFF=1 (off by default, measured above): each time a copy was dropped and uploaded again
+           doubles how long it may stay idle, up to 16 times the age. */
+        if (pk->used + (mode == 3 && evict_backoff_on() ? idle << MIN(pk->restores, 4) : idle) > g_sub_serial) continue;
         if (n == cap) { cap = cap ? cap * 2 : 1024; c = realloc(c, cap * sizeof *c); if (!c) MDIE("evict candidates"); }
         uint64_t ser; memcpy(&ser, g_by_serial.keys + (size_t)i * g_by_serial.klen, 8);
         c[n++] = (evict_cand){(__bridge void *)pk, pk->used, bytes, ser};
@@ -9186,7 +9267,7 @@ static void pkg_evict_sweep(void) {
         qsort(c, n, sizeof *c, evict_cmp);
         for (; k < n && freed < want; k++) {
             NvPkg *pk = (__bridge NvPkg *)c[k].pk;
-            id<MTLTexture> t = pk->tex; pkg_views_drop(pk); pk->tex = nil;
+            id<MTLTexture> t = pk->tex; pkg_views_drop(pk); pk->tex = nil; pk->last_use = pk->used;
             defer_obj_release(t);   // leaves the residency set once the submissions that may sample it completed
             ser_bump_locked(c[k].serial);
             freed += c[k].bytes;
@@ -9206,7 +9287,10 @@ static void pkg_evict_sweep(void) {
     }
     { static uint64_t last_fmt; if (nfmt && g_sub_serial - last_fmt >= 600) { last_fmt = g_sub_serial; char b[512]; size_t o = 0;
         for (int j = 0; j < nfmt; j++) if (fmt_b[j] >> 20) o += (size_t)snprintf(b + o, sizeof b - o, " 格式%lu:%llu张/%lluMB", (unsigned long)fmt_pf[j], (unsigned long long)fmt_n[j], (unsigned long long)(fmt_b[j] >> 20));
-        MLOG("贴图副本按格式：%s", b); } }
+        MLOG("贴图副本按格式：%s", b);
+        MLOG("[copy-restore] uploaded again after a drop, by submissions since the last use: <6k %llu, <12k %llu, <24k %llu, <48k %llu, <96k %llu, <192k %llu, <384k %llu, more %llu; by earlier restores of the same copy: 0 %llu, 1 %llu, 2 %llu, 3 %llu, 4 %llu, 5 %llu, 6 %llu, 7+ %llu; %llu MB of guest bytes",
+             (unsigned long long)g_pkg_gap[0], (unsigned long long)g_pkg_gap[1], (unsigned long long)g_pkg_gap[2], (unsigned long long)g_pkg_gap[3], (unsigned long long)g_pkg_gap[4], (unsigned long long)g_pkg_gap[5], (unsigned long long)g_pkg_gap[6], (unsigned long long)g_pkg_gap[7],
+             (unsigned long long)g_pkg_gap_r[0], (unsigned long long)g_pkg_gap_r[1], (unsigned long long)g_pkg_gap_r[2], (unsigned long long)g_pkg_gap_r[3], (unsigned long long)g_pkg_gap_r[4], (unsigned long long)g_pkg_gap_r[5], (unsigned long long)g_pkg_gap_r[6], (unsigned long long)g_pkg_gap_r[7], (unsigned long long)(g_pkg_gap_bytes >> 20)); } }
     if (k) {} else if (want && mode != 3) {   // mode 3 wants every idle copy: none idle is the normal case, not a shortfall
         static uint64_t last; if (g_sub_serial - last >= 300) { last = g_sub_serial;
             MLOG("贴图副本淘汰：可用 %llu MB，想释放 %llu MB，但没有闲置的副本（副本 %llu 张 / %llu MB）", (unsigned long long)(avail >> 20), (unsigned long long)(want >> 20), (unsigned long long)total_n, (unsigned long long)(total >> 20)); }
@@ -14659,6 +14743,16 @@ static void bz_bind(id<MTLCommandEncoder> en) {
     }
     enc_r_args((id<MTL4RenderCommandEncoder>)en, MTLRenderStageFragment, gpu, BLEND_ZERO_BUFFER);
 }
+/* Diagnostic (2026-11-24, Ocarina of Time in VR: the stairs to the temple are drawn with a coarse model). "flag
+   cam_poke_pct <percent>" gives every draw and dispatch a copy of each matching uniform block with floats scaled:
+   cam_poke_off <byte offset> (and cam_poke_count floats from there, or one more at cam_poke_off2), in blocks of
+   cam_poke_size bytes (0: any), of stage cam_poke_stage (-1: any, 5 compute), whose float at the offset is
+   cam_poke_match thousandths (0: any). 100 %: nothing is done, and nothing costs.
+   What it found, with the game's own camera (flag vr_noturn 1) and its field of view widened (flag vr_fovdeg 145) so
+   that the stairs are coarse from the save point: no float of the 960-, 1,792- or 384-byte view blocks changes the
+   level of detail, nor the 960-byte block's matrices scaled whole for compute alone (0x300 changes what is culled and
+   lit, not the level), nor the 6,144- and 16,960-byte blocks 64 floats at a time (lighting only). The level is
+   therefore not chosen on the GPU from these blocks. */
 static int encode_args(__unsafe_unretained id<MTLCommandEncoder> en, __unsafe_unretained NvShader *sh, int nvn_stage, int metal_vertex) {
     bind_trace(sh, nvn_stage);
     if (nvn_stage == 1 && !metal_vertex && sh->has_bz) bz_bind(en);
@@ -14686,7 +14780,8 @@ static int encode_args(__unsafe_unretained id<MTLCommandEncoder> en, __unsafe_un
         epoch_hit = shader_ab_current(sh) && !memcmp(&epoch, &sh->ab_epoch, sizeof epoch);
         registry_unlock();
     }
-    int reuse = (!shader_uses_pool(sh) || epoch_mode) && !ab_noreuse && !passdump() && shader_ab_current(sh) && sh->ab_pass == g_pass.serial && nvn_stage != 5 &&
+    const int cam_poke = atomic_load_explicit(&g_cam_poke_pct, memory_order_relaxed) != 100;
+    int reuse = !cam_poke && (!shader_uses_pool(sh) || epoch_mode) && !ab_noreuse && !passdump() && shader_ab_current(sh) && sh->ab_pass == g_pass.serial && nvn_stage != 5 &&
         !((g_vr_collapse_draw && VR_MATERIAL_STAGE(nvn_stage)) || (g_vr_ui_ray_draw && nvn_stage == 0)) &&   // Per-draw palette/HUD projection copies must be bound anew.
         (epoch_mode ? epoch_hit : !g_args_dirty[nvn_stage]);
     int verify_epoch = reuse && epoch_mode && atomic_load_explicit(&g_arg_epoch_check, memory_order_relaxed);
@@ -14704,7 +14799,7 @@ static int encode_args(__unsafe_unretained id<MTLCommandEncoder> en, __unsafe_un
     static uint64_t bl_pass[6]; static int bl_all = -1; if (bl_all < 0) bl_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL || getenv("TOTK_INPUT_FILE") != NULL;   // 每次新编都记（否则只记每通道每阶段第一次） | Record on every new encode (otherwise only the first time per pass per stage)
     int bl = passdump() && (bl_all || bl_pass[nvn_stage] != g_stat_pass);
     if (bl) { bl_pass[nvn_stage] = g_stat_pass; PD("K %llu st%d key=%s nb=%d prog=%p", g_stat_pass, nvn_stage, sh->key[0] ? sh->key : sh->builtin ? sh->builtin : "?", sh->rf.nb, (const void *)S.prog); }
-    int cbc = !bl && !g_res_check_on && g_use != USE_REC ? cbc_mode() : 0;   // TOTK_CBUF_CACHE (see cbc_ctx)
+    int cbc = !bl && !cam_poke && !g_res_check_on && g_use != USE_REC ? cbc_mode() : 0;   // TOTK_CBUF_CACHE (see cbc_ctx)
     int slot_mode = tex_slots_on() && !verify_epoch && nvn_stage != 5 && arg_epoch_safe(sh) && !ab_noreuse &&
         !passdump() && !g_res_check_on && g_use != USE_REC && !tex_slots_diagnostics() && !nan_trace_match(sh);
     int slot_check = slot_mode && atomic_load_explicit(&g_tex_slots_check, memory_order_relaxed);
@@ -14777,6 +14872,21 @@ static int encode_args(__unsafe_unretained id<MTLCommandEncoder> en, __unsafe_un
             if (g_vr_collapse_draw && nvn_stage == 0 && reg == 2 && u->size <= 48 * 256) {   // zeldaVR: bones scaled to nothing, from the contents this draw reads (inline updates too)
                 static uint8_t pal[48 * 256]; pend_materialize(u->addr, pal, (size_t)u->size, 0);
                 uint64_t pg = vr_palette_patch(pal, u->size); if (pg) gpu = pg; }
+            if (cam_poke) {   /* any uniform block whose float at the offset is the value asked for (cam_poke_match, thousandths; 0: any) */
+                const int off = atomic_load(&g_cam_poke_off); const float want = (float)atomic_load(&g_cam_poke_match) / 1000.0f;
+                const uint8_t *actual = off >= 0 && (uint64_t)off + 4 <= u->size && u->size <= 65536 ? bound_uniform_bytes(gpu, (size_t)u->size, (__bridge id<MTLBuffer>)mb) : NULL;
+                float f = 0; if (actual) memcpy(&f, actual + off, 4);
+                const int only = atomic_load(&g_cam_poke_stage), size_only = atomic_load(&g_cam_poke_size);   /* cam_poke_stage: -1 any, 5 compute; cam_poke_size: 0 any */
+                if (actual && isfinite(f) && (only < 0 || only == nvn_stage) && (!size_only || (uint64_t)size_only == u->size) && (want == 0 || fabsf(f - want) <= 0.003f * fabsf(want))) {
+                    __unsafe_unretained id<MTLBuffer> copy = nil; uint8_t *bytes = NULL; uint64_t address = 0;
+                    arena_alloc_u((size_t)u->size, &copy, &bytes, &address); memcpy(bytes, actual, (size_t)u->size);
+                    f *= (float)atomic_load(&g_cam_poke_pct) / 100.0f; memcpy(bytes + off, &f, 4);
+                    for (int k = 1, nk = atomic_load(&g_cam_poke_count); k < nk && (uint64_t)off + 4 * (uint64_t)k + 4 <= u->size; k++) { float g; memcpy(&g, bytes + off + 4 * k, 4); g *= (float)atomic_load(&g_cam_poke_pct) / 100.0f; memcpy(bytes + off + 4 * k, &g, 4); }   /* cam_poke_count: that many floats in a row */
+                    { const int off2 = atomic_load(&g_cam_poke_off2); if (off2 >= 0 && (uint64_t)off2 + 4 <= u->size) { float g; memcpy(&g, bytes + off2, 4); g *= (float)atomic_load(&g_cam_poke_pct) / 100.0f; memcpy(bytes + off2, &g, 4); } }   /* cam_poke_off2: a second float, scaled the same */
+                    gpu = address;
+                    if (atomic_fetch_add(&g_cam_poke_n, 1) < 12) MLOG("[cam-poke] stage %d reg %d size %llu shader %.16s: float at %#x -> %g", nvn_stage, reg, (unsigned long long)u->size, sh->key, off, (double)f);
+                }
+            }
             if(g_vr_ui_ray_draw&&nvn_stage==0&&reg==0&&(u->size==560||u->size==128)){
                 const uint8_t *actual=bound_uniform_bytes(gpu,(size_t)u->size,(__bridge id<MTLBuffer>)mb);
                 if(!actual)MDIE("HUD projection lost its actual uniform snapshot");
@@ -20691,7 +20801,7 @@ static void copy_t2b(const p_copy_b2t *c) {
 /* GPU region conversion avoids a full-level CPU decode/encode for small texel access.
    Completion is synchronous: CPU results and guest pool mirrors are visible before returning.
    Caller-owned pool/texture lifetimes and NVN synchronization requirements are unchanged. */
-static _Atomic uint64_t g_texels_gpu_reads,g_texels_gpu_writes,g_texels_gpu_bytes,g_texels_gpu_failures;
+
 void mtl_texels_gpu_report(void) {
     MLOG("[texels-gpu] reads=%llu writes=%llu bytes=%llu failures=%llu",
          (unsigned long long)atomic_load(&g_texels_gpu_reads),(unsigned long long)atomic_load(&g_texels_gpu_writes),
