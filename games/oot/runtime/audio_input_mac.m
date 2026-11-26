@@ -61,6 +61,26 @@ static int device_string(AudioDeviceID device, AudioObjectPropertySelector selec
     return ok && out[0];
 }
 
+static int device_has_input_streams(AudioDeviceID device) {
+    if (device == kAudioObjectUnknown) return 0;
+    UInt32 size = 0;
+    AudioObjectPropertyAddress input = {kAudioDevicePropertyStreams, kAudioDevicePropertyScopeInput, kAudioObjectPropertyElementMain};
+    return AudioObjectGetPropertyDataSize(device, &input, 0, NULL, &size) == noErr && size > 0;
+}
+
+static UInt32 device_transport_type(AudioDeviceID device) {
+    if (device == kAudioObjectUnknown) return 0;
+    UInt32 transport = 0, size = sizeof transport;
+    AudioObjectPropertyAddress address = {kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    if (AudioObjectGetPropertyData(device, &address, 0, NULL, &size, &transport) != noErr) return 0;
+    return transport;
+}
+
+static int device_is_bluetooth(AudioDeviceID device) {
+    UInt32 t = device_transport_type(device);
+    return t == kAudioDeviceTransportTypeBluetooth || t == kAudioDeviceTransportTypeBluetoothLE;
+}
+
 static AudioDeviceID input_device_for_uid(const char *uid) {
     if (!uid || !*uid) return kAudioObjectUnknown;
     CFStringRef value = CFStringCreateWithCString(NULL, uid, kCFStringEncodingUTF8);
@@ -71,15 +91,46 @@ static AudioDeviceID input_device_for_uid(const char *uid) {
     OSStatus status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, sizeof(CFStringRef), &value, &size, &device);
     CFRelease(value);
     if (status != noErr || device == kAudioObjectUnknown) return kAudioObjectUnknown;
-    AudioObjectPropertyAddress input = {kAudioDevicePropertyStreams, kAudioDevicePropertyScopeInput, kAudioObjectPropertyElementMain};
-    return AudioObjectGetPropertyDataSize(device, &input, 0, NULL, &size) == noErr && size ? device : kAudioObjectUnknown;
+    return device_has_input_streams(device) ? device : kAudioObjectUnknown;
+}
+
+static AudioDeviceID builtin_input_device(void) {
+    AudioDeviceID direct = input_device_for_uid("BuiltInMicrophoneDevice");
+    if (direct != kAudioObjectUnknown) return direct;
+    AudioObjectPropertyAddress address = devices_address();
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &address, 0, NULL, &size) != noErr || size < sizeof(AudioDeviceID))
+        return kAudioObjectUnknown;
+    size_t count = size / sizeof(AudioDeviceID);
+    AudioDeviceID *list = malloc(size);
+    if (!list) return kAudioObjectUnknown;
+    AudioDeviceID found = kAudioObjectUnknown;
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, NULL, &size, list) == noErr) {
+        for (size_t i = 0; i < count; i++) {
+            if (device_has_input_streams(list[i]) && device_transport_type(list[i]) == kAudioDeviceTransportTypeBuiltIn) {
+                found = list[i];
+                break;
+            }
+        }
+    }
+    free(list);
+    return found;
 }
 
 static AudioDeviceID selected_input_device(int *uses_default, int *fell_back) {
     const char *uid = getenv("OOT_MIC_DEVICE");
     *uses_default = !uid || !*uid || !strcmp(uid, "default");
     *fell_back = 0;
-    if (*uses_default) return default_input_device();
+    if (*uses_default) {
+        AudioDeviceID def = default_input_device();
+        // Opening a Bluetooth headset mic (e.g. AirPods) forces macOS to switch output between A2DP and HFP/SCO,
+        // stalling CoreAudio for ~0.75 s and causing output overruns/crackle when the ocarina opens/closes.
+        if (def != kAudioObjectUnknown && device_is_bluetooth(def)) {
+            AudioDeviceID builtin = builtin_input_device();
+            if (builtin != kAudioObjectUnknown) return builtin;
+        }
+        return def;
+    }
     AudioDeviceID selected = input_device_for_uid(uid);
     if (selected != kAudioObjectUnknown) return selected;
     *fell_back = 1;
@@ -193,7 +244,10 @@ static OSStatus input_proc(void *ctx, AudioUnitRenderActionFlags *flags, const A
         atomic_fetch_sub_explicit(&d->callbacks, 1, memory_order_release);
         return kAudio_ParamError;
     }
-    for (int i = 0; i < d->channel_count; i++) d->buffers->mBuffers[i].mDataByteSize = frames * sizeof(float);
+    for (int i = 0; i < d->channel_count; i++) {
+        d->buffers->mBuffers[i].mData = d->planes[i];
+        d->buffers->mBuffers[i].mDataByteSize = frames * sizeof(float);
+    }
     OSStatus status = AudioUnitRender(d->unit, flags, time, 1, frames, d->buffers);
     if (status != noErr) {
         atomic_store_explicit(&d->failed, 1, memory_order_release);
@@ -201,7 +255,14 @@ static OSStatus input_proc(void *ctx, AudioUnitRenderActionFlags *flags, const A
         return status;
     }
     const float *planes[INPUT_CHANNEL_MAX];
-    for (int i = 0; i < d->channel_count; i++) planes[i] = d->planes[i];
+    for (int i = 0; i < d->channel_count; i++) {
+        planes[i] = d->buffers->mBuffers[i].mData;
+        if (!planes[i]) {
+            atomic_store_explicit(&d->failed, 1, memory_order_release);
+            atomic_fetch_sub_explicit(&d->callbacks, 1, memory_order_release);
+            return kAudio_ParamError;
+        }
+    }
     dm_audio_input_process(planes, d->channel_count, frames, d->format.mSampleRate);
     atomic_fetch_sub_explicit(&d->callbacks, 1, memory_order_release);
     return noErr;
@@ -289,7 +350,9 @@ static int input_prepare_locked(void) {
     if (!device_string(device, kAudioObjectPropertyName, g_input.name)) strlcpy(g_input.name, "Unknown input device", sizeof g_input.name);
     if (!device_string(device, kAudioDevicePropertyDeviceUID, g_input.uid)) strlcpy(g_input.uid, "unknown", sizeof g_input.uid);
     fprintf(stderr, "[ns2-audio] audio input: opened device=\"%s\" uid=\"%s\" rate=%.0f channels=%u%s\n", g_input.name, g_input.uid,
-            client.mSampleRate, (unsigned)channels, uses_default ? " (system default)" : fell_back ? " (fallback)" : " (selected)");
+            client.mSampleRate, (unsigned)channels,
+            uses_default ? (device != default_input_device() ? " (built-in, skipping Bluetooth)" : " (system default)")
+                         : fell_back ? " (fallback)" : " (selected)");
     for (int i = 0; i < INPUT_CHANNEL_MAX; i++) g_input.planes[i] = planes[i];
     atomic_store_explicit(&g_input.failed, 0, memory_order_release);
     return 1;

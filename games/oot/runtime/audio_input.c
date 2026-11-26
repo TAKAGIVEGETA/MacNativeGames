@@ -31,11 +31,13 @@ static _Atomic int input_ready;
 static pthread_mutex_t input_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned input_started_count;
 
-// Resampler state belongs to the single AUHAL producer callback.
+// Resampler & live-capture conditioning state belong to the single AUHAL producer callback.
 static double input_rate, input_next_output;
 static uint64_t input_frame_index;
 static float input_previous;
 static int input_have_previous;
+static float input_hp_x, input_hp_y, input_env_fast, input_noise_floor, input_gate_gain;
+static int input_dsp_ready, input_dsp_on;
 
 typedef struct {
     uint64_t samples, pre_squares, post_squares;
@@ -47,10 +49,64 @@ static float bits_float(uint32_t u) { float f; memcpy(&f, &u, sizeof f); return 
 
 static float input_user_gain(void) {
     const char *text = getenv("OOT_MIC_GAIN");
-    if (!text || !*text) return 4.0f;
+    if (!text || !*text) return 1.0f;
     char *end = NULL;
     float gain = strtof(text, &end);
-    return end != text && !*end && isfinite(gain) && gain >= 1.0f && gain <= 8.0f ? gain : 4.0f;
+    return end != text && !*end && isfinite(gain) && gain >= 0.1f && gain <= 8.0f ? gain : 1.0f;
+}
+
+static void input_dsp_reset(void) {
+    const char *raw = getenv("OOT_MIC_RAW");
+    const char *feed = getenv("OOT_MIC_FILE");
+    input_dsp_on = !(raw && !strcmp(raw, "1")) && !(feed && *feed);
+    input_hp_x = 0.0f;
+    input_hp_y = 0.0f;
+    input_env_fast = 0.0f;
+    input_noise_floor = 0.012f;   // ~-38 dBFS initial ceiling; decays rapidly in quiet rooms and catches active laptop fans immediately
+    input_gate_gain = 0.03f;
+    input_dsp_ready = 1;
+}
+
+/* 150 Hz 1st-order high-pass + adaptive fan-noise gate for live microphone capture at 48 kHz:
+   keeps steady laptop fan noise (~-39..-43 dBFS) below Ocarina of Time's ~-45 dBFS end-of-phrase silence threshold
+   while passing humming/ocarina notes (D4 294 Hz .. D5 587 Hz) transparently at unity gain. */
+static float input_condition_live(float x) {
+    if (!isfinite(x)) x = 0.0f;
+    if (!input_dsp_ready) input_dsp_reset();
+    if (!input_dsp_on) return x;
+    // 1st-order high-pass at 150 Hz (fs = 48 kHz): a = 1 / (1 + 2*pi*150/48000) = 0.98074
+    const float hp_a = 0.98074f;
+    float y = hp_a * (input_hp_y + x - input_hp_x);
+    input_hp_x = x;
+    input_hp_y = y;
+
+    float a = fabsf(y);
+    // Fast envelope: 6 ms attack, 90 ms release
+    float env_coeff = a > input_env_fast ? 0.003466f : 0.000231f;
+    input_env_fast += env_coeff * (a - input_env_fast);
+
+    // Slow adaptive noise floor: falls quickly in quiet rooms (~150 ms), tracks gradual fan ramp-up (~1.5 s),
+    // and freezes during active humming (> 2.5x noise floor) so sustained notes never raise the floor.
+    if (input_env_fast < input_noise_floor) {
+        input_noise_floor += 0.000139f * (input_env_fast - input_noise_floor);
+        if (input_noise_floor < 0.0002f) input_noise_floor = 0.0002f;
+    } else if (input_env_fast < input_noise_floor * 2.5f) {
+        input_noise_floor += 0.0000139f * (input_env_fast - input_noise_floor);
+        if (input_noise_floor > 0.030f) input_noise_floor = 0.030f;
+    }
+
+    float open_th = input_noise_floor * 2.4f;
+    if (open_th < 0.0040f) open_th = 0.0040f;
+    float close_th = open_th * 0.65f;
+    float target;
+    if (input_env_fast >= open_th) target = 1.0f;
+    else if (input_env_fast <= close_th) target = 0.03f;
+    else target = 0.03f + 0.97f * (input_env_fast - close_th) / (open_th - close_th);
+
+    // Smooth gate gain: 5 ms attack, 100 ms release
+    float gate_coeff = target > input_gate_gain ? 0.00416f : 0.000208f;
+    input_gate_gain += gate_coeff * (target - input_gate_gain);
+    return y * input_gate_gain;
 }
 
 static uint64_t monotonic_ns(void) {
@@ -140,10 +196,12 @@ static void input_close_capture_locked(void) {
     dm_audio_input_platform_close();  // joins the callback before resetting its resampler
     input_rate = 0;
     input_have_previous = 0;
+    input_dsp_ready = 0;
 }
 
 static int input_start_capture_locked(void) {
     input_close_capture_locked();
+    input_dsp_reset();
     if (dm_audio_input_platform_prepare() || dm_audio_input_platform_start()) {
         dm_audio_input_platform_close();
         return -1;
@@ -301,7 +359,8 @@ void dm_audio_input_set_gain(dm_audio_input_stream *s, float gain) {
     atomic_store_explicit(&s->gain_bits, float_bits(gain), memory_order_relaxed);
 }
 
-static void input_push_sample(float value, dm_audio_input_stream *const *streams, input_level_window *levels) {
+static void input_push_sample_conditioned(float raw_value, float value, dm_audio_input_stream *const *streams, input_level_window *levels) {
+    if (!(raw_value == raw_value)) raw_value = 0.0f;
     if (!(value == value)) value = 0.0f;
     for (int i = 0; i < INPUT_MAX; i++) {
         dm_audio_input_stream *s = streams[i];
@@ -311,7 +370,7 @@ static void input_push_sample(float value, dm_audio_input_stream *const *streams
         float gain = user_gain * game_gain;
         if (gain > 8.0f) gain = 8.0f;
         float sample = soft_limit(value * gain);
-        level_add(&levels[i], value, sample);
+        level_add(&levels[i], raw_value, sample);
         uint32_t tail = atomic_load_explicit(&s->tail, memory_order_relaxed);
         uint32_t head = atomic_load_explicit(&s->head, memory_order_acquire);
         atomic_fetch_add_explicit(&s->captured, 1, memory_order_relaxed);
@@ -320,6 +379,10 @@ static void input_push_sample(float value, dm_audio_input_stream *const *streams
         s->samples[tail & s->sample_mask] = pcm;
         atomic_store_explicit(&s->tail, tail + 1, memory_order_release);
     }
+}
+
+static void input_push_sample(float value, dm_audio_input_stream *const *streams, input_level_window *levels) {
+    input_push_sample_conditioned(value, value, streams, levels);
 }
 
 /* A song played from the settings panel's 陶笛 page (ours, user 2026-11-20): while it plays it is the only producer, the
@@ -369,6 +432,7 @@ void dm_audio_input_process(const float *const *channels, int channel_count, uin
     for (int i = 0; i < INPUT_MAX; i++) streams[i] = atomic_load_explicit(&input_streams[i], memory_order_seq_cst);
     if (input_rate != sample_rate) {
         input_rate = sample_rate; input_next_output = 0; input_frame_index = 0; input_previous = 0; input_have_previous = 0;
+        input_dsp_ready = 0;
     }
     double step = sample_rate / DM_AUDIO_INPUT_RATE;
     for (uint32_t i = 0; i < frames; i++) {
@@ -376,14 +440,17 @@ void dm_audio_input_process(const float *const *channels, int channel_count, uin
         for (int c = 0; c < channel_count; c++) mono += channels[c][i];
         mono /= (float)channel_count;
         if (!input_have_previous) {
-            input_push_sample(mono, streams, levels);
+            input_push_sample_conditioned(mono, input_condition_live(mono), streams, levels);
             input_previous = mono; input_have_previous = 1; input_frame_index = 1; input_next_output = step;
             continue;
         }
         uint64_t t = input_frame_index++;
         while (input_next_output <= (double)t) {
             double fraction = input_next_output - (double)(t - 1);
-            if (fraction >= 0.0) input_push_sample(input_previous + (mono - input_previous) * (float)fraction, streams, levels);
+            if (fraction >= 0.0) {
+                float raw = input_previous + (mono - input_previous) * (float)fraction;
+                input_push_sample_conditioned(raw, input_condition_live(raw), streams, levels);
+            }
             input_next_output += step;
         }
         input_previous = mono;

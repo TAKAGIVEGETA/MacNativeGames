@@ -279,7 +279,7 @@ int runtime_ns2_input_stream_probe(void) {
     int16_t tone[960]; int n = read_stream(stream, tone, 960), peak = 0, crossings = 0;
     for (int i = 0; i < n; i++) { int a = tone[i] < 0 ? -tone[i] : tone[i]; if (a > peak) peak = a; if (i && (tone[i - 1] < 0) != (tone[i] < 0)) crossings++; }
     INPUT_STREAM_CHECK(n == 960, "Read returns the frames asked for");
-    INPUT_STREAM_CHECK(peak > 6000 && peak < 32767, "the tone arrives with the default gain (0.1 x 4), not clipped");
+    INPUT_STREAM_CHECK(peak > 2000 && peak < 6000, "the tone arrives with the default gain (0.1 x 1), not clipped");
     INPUT_STREAM_CHECK(crossings >= 15 && crossings <= 19, "20 ms of 440 Hz crosses zero about 17 times");
     /* the 陶笛 page's song in place of the feed: one note of 587.33 Hz (C-up), and nothing of the feed's 440 Hz meanwhile */
     static const double up[1] = {587.33};
